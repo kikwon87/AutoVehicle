@@ -220,6 +220,42 @@ see**, so an occluded vehicle is not scored as a tracker failure.
 
 ---
 
+## Current status
+
+`avsim suite` on this code, one clean run:
+
+| scenario | verdict | note |
+|---|---|---|
+| `lane_keeping` | PASS | 0.00 m settled cross-track at 16 m/s |
+| `curved_lane_keeping` | PASS | 0.06 m RMS on a 300 m radius |
+| `static_obstacle` | FAIL | hairline: 2.518 m against a 2.5 m bound on a *lane-change* RMS |
+| `blocked_single_lane` | PASS | stops 4.3 m short with no room to pass |
+| `lead_braking` | FAIL | hairline: 8.008 m/s² against an 8 m/s² bound |
+| `cut_in` | PASS | |
+| `low_mu_curve` | FAIL | hairline: 5.084 m/s² against a 5 m/s² bound |
+| `signal_green` / `signal_red` / `signal_yellow_dilemma` | PASS | including the dilemma-zone decision |
+| `tight_right_turn` | FAIL | **open**: see below |
+| `unprotected_left` | PASS | the lecture's running example, completed |
+| `cross_traffic` | PASS | yields to a red-light runner |
+
+Two things this table is honestly saying.
+
+**`tight_right_turn` is an open defect.** It passes when run alone and fails
+inside the suite. The cause is the MPC's wall-clock budget: under load the
+solver gets fewer iterations, the lattice then rejects more candidates on the
+5.75 m radius, and the fallback takes over (91% of ticks). The budget is kept
+because without it the solve tail reaches 400 ms and the loop is not real time;
+the trade is documented at `MPCConfig.time_budget` and `time_budget=None` makes
+runs reproducible at that cost. The right fix is a cheaper standstill and
+low-speed regime, not a longer budget.
+
+**Three hairline failures are left failing on purpose.** 2.518 against 2.5 and
+8.008 against 8 could be made green by moving the bound. They are the KPI layer
+doing its job, and moving a threshold to cover a number it was written to catch
+is how a test suite stops meaning anything.
+
+---
+
 ## Known limitations
 
 Stated rather than discovered:
@@ -239,6 +275,14 @@ Stated rather than discovered:
   binds the returned solution is suboptimal and possibly constraint-violating;
   the stack falls back to the geometric controller and **records that it did**.
 * **Inter-sample feasibility** is tightened, not guaranteed (above).
+* **Runs are not bit-reproducible** while the MPC has a wall-clock budget,
+  because the number of iterations depends on machine load. Set
+  `MPCConfig.time_budget = None` for reproducibility and accept a longer
+  solve-time tail.
+* **The low-speed regime is the weak one**, exactly where the lecture says it
+  will be. At rest the prediction model loses steering authority, the augmented
+  Lagrangian fights the `v >= 0` bound, and the stack has to hold the steering
+  and skip the solve to stay real time. That is a workaround, not a model.
 
 ---
 

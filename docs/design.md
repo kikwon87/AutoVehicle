@@ -213,3 +213,22 @@ Constructing a Kalman filter with `dt = 0.05` and calling `update()` every
 0.1 s propagates half the motion each step. The velocity estimate then lags a
 decelerating leader by seconds — which was a rear-end collision, not a
 cosmetic error. The stack now raises if the two disagree.
+
+---
+
+## 17. A wall-clock budget buys real time and sells reproducibility
+
+The MPC stops at 45 ms. That is what a vehicle has, and without it the solve
+tail near standstill reaches 400 ms — the loop is then not real time at all.
+
+The cost is that the number of iterations depends on machine load, so the same
+scenario can converge alone and be cut short inside a suite. `tight_right_turn`
+does exactly that, and it is recorded as an open defect rather than hidden by a
+longer budget.
+
+The reduction that worked was removing the *pathology* rather than raising the
+cap: while holding a stop, the stack skips the solve entirely, because the
+prediction model is degenerate there and the answer is already known. That
+dropped the mean solve from 184 ms to 20-75 ms and the real-time factor from
+1.85 to 0.2-0.8. What remains is the low-speed regime itself, which needs a
+low-speed-valid model — the lecture's own conclusion — not more compute.

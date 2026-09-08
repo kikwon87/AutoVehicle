@@ -104,6 +104,8 @@ class AutonomyConfig:
     #: far edge.
     corridor_bounds: tuple[float, float] | None = None
     lateral_use: float = 0.5
+    #: Headroom the lattice's feasibility check allows above the planned budget.
+    lateral_margin: float = 1.2
     longitudinal_use: float = 0.6
     #: replan the velocity profile every this many control ticks
     profile_every: int = 5
@@ -184,14 +186,22 @@ class AutonomyStack:
             else ConstantVelocityPredictor()
         )
         self.behavior = behavior or BehaviorPlanner(params, BehaviorConfig())
+        # The velocity profile plans *at* the lateral budget, so the lattice's
+        # feasibility bound has to sit above it.  Set equal, the profile's own
+        # nominal speed makes every candidate marginally infeasible and the
+        # planner reports no plan on exactly the corners it was built for -- the
+        # 5.75 m right turn fails 87% of its ticks that way.
         lat_cfg = LatticeConfig(
-            a_lat_limit=params.max_lateral_accel(self.cfg.lateral_use),
+            a_lat_limit=params.max_lateral_accel(self.cfg.lateral_use) * self.cfg.lateral_margin,
             a_lon_max=min(params.actuator.a_max, self.cfg.longitudinal_use * params.mu * 9.80665),
             a_lon_min=max(params.actuator.a_min, -self.cfg.longitudinal_use * params.mu * 9.80665),
         )
         self.lattice = lattice or FrenetLatticePlanner(params, lat_cfg)
         self.mpc = mpc or VehicleMPC(
-            params, MPCConfig(a_y_max=params.max_lateral_accel(self.cfg.lateral_use))
+            params,
+            MPCConfig(
+                a_y_max=params.max_lateral_accel(self.cfg.lateral_use) * self.cfg.lateral_margin
+            ),
         )
 
         self.lights = lights
@@ -452,6 +462,34 @@ class AutonomyStack:
         ss = np.array([self.route.project(px, py, s_guess=s) for px, py in reference[:, :2]])
         corridor = self._corridor(ss)
         x0 = np.array([x_rear[0], x_rear[1], x_rear[2], v, delta_actual])
+        # Holding a stop: the prediction model is degenerate at rest (the
+        # steering column of B vanishes) and the augmented Lagrangian spends
+        # hundreds of milliseconds fighting the v >= 0 bound for an answer that
+        # is already known -- stay put.  Skipping the solve here is what keeps
+        # the loop real-time without a wall-clock budget, which would make
+        # results depend on machine load.
+        plan_speed = float(np.interp(0.6, traj.t, traj.v))
+        if v < cfg.standstill_speed and plan_speed < cfg.standstill_speed and self._tick > 0:
+            cmd = np.array([float(traj.a[0]), float(self._last_cmd[1])])
+            self._last_cmd = cmd
+            self._tick += 1
+            self.telemetry.append(
+                Telemetry(
+                    t=t, s=s, e_y=e_y, v=v,
+                    behavior=decision.state.value, reason=decision.reason,
+                    target_speed=decision.target_speed, ref_speed=plan_speed,
+                    n_detections=len(detections), n_tracks=len(self.tracks),
+                    n_predictions=len(self.predictions),
+                    mpc_status="skipped_at_standstill", mpc_time=0.0,
+                    mpc_violation=0.0, mpc_iterations=0,
+                    a_cmd=float(cmd[0]), delta_cmd=float(cmd[1]),
+                    used_fallback_plan=used_fallback_plan, used_fallback_control=False,
+                    trajectory_offset=float(traj.target_offset), stop_s=stop_abs,
+                    detail=dict(decision.detail, standstill=True),
+                )
+            )
+            return cmd
+
         stop_constraint = None
         # An already-violated hard constraint is poison for an augmented
         # Lagrangian: the multiplier grows without bound, the solve never

@@ -125,13 +125,25 @@ class MPCConfig:
     inflate_sigma: float = 1.0
     n_circles: int = 3
     max_obstacles: int = 4
-    #: Wall-clock budget for one solve.  The stack runs the controller every
-    #: 100 ms, so half of that leaves room for perception, prediction and
-    #: planning in the same tick while still converging the augmented
-    #: Lagrangian on the manoeuvres that activate several constraints at once.
-    time_budget: float = 0.045
-    max_iter: int = 15
-    max_al_iter: int = 5
+    #: Wall-clock budget for one solve, or ``None`` for iteration bounds only.
+    #:
+    #: This is a real trade and it is worth stating plainly. A wall-clock bound
+    #: is what a vehicle has: the controller runs every 100 ms and a solve that
+    #: overruns has answered a different question, late. But in simulation it
+    #: makes the closed loop depend on **machine load** -- the same scenario
+    #: converges in isolation and is cut short inside a suite, and two runs of
+    #: identical code disagree.
+    #:
+    #: The budget is kept, because without it the pathological solves near
+    #: standstill reach 400 ms and the loop is no longer real-time at all. What
+    #: reduces the damage is removing the pathology instead: the stack skips
+    #: the solve entirely while holding a stop (see
+    #: ``AutonomyConfig.standstill_speed``), so the budget now binds rarely.
+    #: Set it to ``None`` for bit-reproducible runs, and expect the tail of
+    #: ``solve_time_p95`` to grow.
+    time_budget: float | None = 0.045
+    max_iter: int = 12
+    max_al_iter: int = 4
 
 
 @dataclass
