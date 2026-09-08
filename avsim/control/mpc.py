@@ -125,10 +125,13 @@ class MPCConfig:
     inflate_sigma: float = 1.0
     n_circles: int = 3
     max_obstacles: int = 4
-    #: solver budget; the controller runs at ``1 / dt`` Hz, so this must be less
-    time_budget: float = 0.030
-    max_iter: int = 10
-    max_al_iter: int = 4
+    #: Wall-clock budget for one solve.  The stack runs the controller every
+    #: 100 ms, so half of that leaves room for perception, prediction and
+    #: planning in the same tick while still converging the augmented
+    #: Lagrangian on the manoeuvres that activate several constraints at once.
+    time_budget: float = 0.045
+    max_iter: int = 15
+    max_al_iter: int = 5
 
 
 @dataclass

@@ -51,6 +51,11 @@ from . import powertrain, suspension as susp
 from .params import VehicleParams
 from .tire import LinearTire, PacejkaTire, SLIP_EPS, apply_combined_slip, friction_ellipse_usage
 
+#: Speed below which the tires stop producing lateral force [m/s].  A modelling
+#: parameter, not a physical constant: it sets where the slip-angle description
+#: is abandoned, and it must be validated like any other.
+LATERAL_FORCE_SPEED_EPS = 0.7
+
 IDX_BODY = slice(0, 6)
 IDX_SUSP = slice(6, 10)
 IDX_ACT = slice(10, 13)
@@ -202,8 +207,15 @@ class DynamicBicycle:
         alpha_f = float(delta - np.arctan2(v_y + p.l_f * r, vx_reg))
         alpha_r = float(-np.arctan2(v_y - p.l_r * r, vx_reg))
 
-        F_yf_demand = self.tire_f.lateral_force(alpha_f, F_zf, mu)
-        F_yr_demand = self.tire_r.lateral_force(alpha_r, F_zr, mu)
+        # A slip angle is a *ratio of velocities*: at zero speed there is no
+        # slip and therefore no lateral force, however large the regularized
+        # angle computes to be.  Without this factor a stopped vehicle keeps
+        # generating a yaw moment from its own residual v_y and r, and rotates
+        # on the spot -- which shows up as tens of degrees of heading error in
+        # every scenario that ends with the vehicle standing still.
+        speed_factor = float(np.tanh(abs(v_x) / LATERAL_FORCE_SPEED_EPS))
+        F_yf_demand = self.tire_f.lateral_force(alpha_f, F_zf, mu) * speed_factor
+        F_yr_demand = self.tire_r.lateral_force(alpha_r, F_zr, mu) * speed_factor
 
         # Combined slip, per axle: the longitudinal request is committed and
         # the lateral force absorbs the shortfall.
@@ -277,6 +289,12 @@ class DynamicBicycle:
         # can only bring v_x to zero.
         if z[3] < 0.0 and z[12] > 0.0:
             z[3] = 0.0
+        # A stopped car does not rotate.  The lateral force already vanishes at
+        # zero speed, but nothing then removes whatever yaw rate was left over,
+        # so it is removed here explicitly.
+        if abs(z[3]) < 0.05:
+            z[4] = 0.0
+            z[5] = 0.0
         return z
 
 

@@ -70,9 +70,15 @@ def run_setup(setup: ScenarioSetup, verbose: bool = False) -> RunResult:
 
         world.step(cmd)
 
-        # A run ends when the route is exhausted; continuing past it measures
-        # the planner's behaviour on a path that no longer exists.
+        # A run ends at its goal, or when the route is exhausted.
+        #
+        # Stopping at the goal matters for more than tidiness: past it the
+        # planner brakes for the end of a finite route, and that deceleration
+        # lands in the comfort KPIs of a scenario that was never about braking.
         s_now = stack._s
+        if setup.goal_s is not None and s_now >= setup.goal_s:
+            terminated = "goal reached"
+            break
         if s_now >= setup.route.length - 2.0:
             terminated = "route complete"
             break

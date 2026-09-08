@@ -98,7 +98,16 @@ class BehaviorConfig:
     #: Consecutive ticks a predicted contact must persist before emergency
     #: braking.  A single frame of it is usually a perception artefact.
     emergency_confirm: int = 2
+    #: Consecutive clear ticks before emergency braking is released.  Without a
+    #: latch the state alternates with whatever ran before it, and the two
+    #: issue opposite lateral targets on alternate ticks.
+    emergency_release: int = 6
     creep_speed: float = 1.5           #: speed while inching for visibility [m/s]
+    #: Speed to clear an intersection the ego is already committed inside [m/s]
+    clear_speed: float = 4.0
+    #: Acceleration assumed when estimating how long a *standing* vehicle needs
+    #: to clear the box [m/s^2].
+    launch_accel: float = 1.5
     comfortable_decel: float = 3.0
     #: A lead slower than this is an obstacle to go around, not a car to follow.
     overtake_speed: float = 1.0
@@ -117,8 +126,10 @@ class BehaviorPlanner:
         self.dilemma = DilemmaZone(comfortable_decel=self.cfg.comfortable_decel)
         self.state = BehaviorState.CRUISE
         self._overtake_offset = 0.0
+        self._overtake_side = 0.0
         self._overtake_until = -np.inf
         self._emergency_streak = 0
+        self._clear_streak = 0
         self._ego_off, self._ego_r = multi_circle_cover(params.length, params.width, 3)
 
     def reset(self) -> None:
@@ -227,20 +238,37 @@ class BehaviorPlanner:
         e_y_ego: float = 0.0,
     ) -> BehaviorDecision:
         cfg = self.cfg
+        # "Committed" means the front of the vehicle is past the stop line, so
+        # the box can only be left by going forward.
+        committed = stop_line_s is not None and s_ego > stop_line_s - 1.0
 
         # --- 1. emergency ----------------------------------------------------
         t_conf, pred, prob = self.conflict_time(ego_path, times, predictions)
         if t_conf is not None and t_conf < cfg.t_emergency:
             self._emergency_streak += 1
+            self._clear_streak = 0
         else:
-            self._emergency_streak = 0
-        if self._emergency_streak >= cfg.emergency_confirm:
+            self._clear_streak += 1
+            if self._clear_streak >= cfg.emergency_release:
+                self._emergency_streak = 0
+        latched = (
+            self.state is BehaviorState.EMERGENCY_STOP
+            and self._clear_streak < cfg.emergency_release
+        )
+        if (self._emergency_streak >= cfg.emergency_confirm or latched) and not (
+            committed and crossing_conflict
+        ):
             self.state = BehaviorState.EMERGENCY_STOP
             return BehaviorDecision(
                 state=self.state,
                 target_speed=0.0,
                 stop_s=s_ego + max(stopping_distance(v_ego, self.p.actuator.a_min), 0.5),  # absolute
-                reason=f"predicted contact in {t_conf:.2f} s with track {pred.track_id if pred else '?'}",
+                lateral_offset=self._overtake_offset if t_now < self._overtake_until else 0.0,
+                reason=(
+                    f"predicted contact in {t_conf:.2f} s with track "
+                    f"{pred.track_id if pred else '?'}"
+                    if t_conf is not None else "holding the emergency stop"
+                ),
                 detail={"t_conflict": t_conf, "mode": pred.mode if pred else None},
             )
 
@@ -257,6 +285,18 @@ class BehaviorPlanner:
                     return decision
 
         # --- 3. intersection conflict ---------------------------------------
+        if crossing_conflict and t_conf is not None and committed:
+            # Already inside the box: stopping here is the one thing that is
+            # certainly wrong.  A vehicle with right of way is arriving and the
+            # ego is parked in its path, which is exactly how the unprotected
+            # left ends in a collision.  Clear.
+            self.state = BehaviorState.CLEAR_INTERSECTION
+            return BehaviorDecision(
+                state=self.state,
+                target_speed=max(v_ego, cfg.clear_speed),
+                reason=f"committed inside the box, conflict in {t_conf:.2f} s: clearing",
+                detail={"t_conflict": t_conf, "mode": pred.mode if pred else None},
+            )
         if crossing_conflict and t_conf is not None:
             # Stop short of the conflict rather than at the stop line: on an
             # unprotected turn the ego may legally be inside the box already.
@@ -292,12 +332,22 @@ class BehaviorPlanner:
             # room to make it, so it is made here rather than left to the
             # lattice's cost to discover.
             if lead_v < cfg.overtake_speed and gap < 6.0 * max(v_ego, 1.0):
-                room_left = corridor[1] - e_y_ego
-                room_right = e_y_ego - corridor[0]
+                # Room is measured from the *lane centre*, not from where the
+                # vehicle currently is: half way through the manoeuvre the two
+                # sides look equally roomy, and re-deciding then flips the
+                # vehicle back across the obstacle it was passing.
+                room_left = corridor[1]
+                room_right = -corridor[0]
                 if max(room_left, room_right) >= cfg.overtake_room:
-                    side = 1.0 if room_left >= room_right else -1.0
-                    offset = side * min(cfg.overtake_offset, max(room_left, room_right) - 0.4)
+                    if self._overtake_side == 0.0:
+                        self._overtake_side = 1.0 if room_left >= room_right else -1.0
+                    side = self._overtake_side
+                    room = room_left if side > 0 else room_right
+                    offset = side * min(cfg.overtake_offset, room - 0.4)
                     self._overtake_offset = float(offset)
+                    # Re-arm every tick the object is still ahead, so the
+                    # commitment outlasts the manoeuvre rather than expiring in
+                    # the middle of it.
                     self._overtake_until = t_now + cfg.overtake_hold
                     self.state = BehaviorState.OVERTAKE
                     return BehaviorDecision(
@@ -345,10 +395,27 @@ class BehaviorPlanner:
                 )
 
         # --- 6. cruise --------------------------------------------------------
+        self._overtake_side = 0.0   # nothing ahead: the next overtake is free to choose
         self.state = BehaviorState.CRUISE
         return BehaviorDecision(state=self.state, target_speed=speed_limit, reason="clear")
 
     # --- signal logic --------------------------------------------------------
+
+    def _time_to_clear(self, dist: float, v_ego: float, box_length: float) -> float:
+        """Seconds to put the whole vehicle past the far side of the box.
+
+        Dividing the distance by the *current* speed is wrong for a stopped
+        vehicle: it returns something near infinity, no green is ever long
+        enough, and a car waiting at a red light can never decide to depart when
+        it turns green. From rest the estimate is the launch profile
+        ``t = sqrt(2 d / a)`` instead.
+        """
+        d = dist + box_length
+        if v_ego < 1.0:
+            return float(np.sqrt(2.0 * d / max(self.cfg.launch_accel, 1e-3)))
+        # Moving: distance over speed, but never slower than the launch profile
+        # would manage from here.
+        return float(min(d / v_ego, np.sqrt(2.0 * d / self.cfg.launch_accel) + v_ego * 0.0))
 
     def _signal_decision(
         self,
@@ -393,7 +460,7 @@ class BehaviorPlanner:
 
         # Green -- but is it green long enough to get across?
         if dist > 0.5:
-            time_to_clear = (dist + box_length) / max(v_ego, 0.5)
+            time_to_clear = self._time_to_clear(dist, v_ego, box_length)
             if not lights.will_be_green_at(group, t_now, min(time_to_clear, 12.0)):
                 if self.dilemma.can_stop(dist, v_ego):
                     return BehaviorDecision(

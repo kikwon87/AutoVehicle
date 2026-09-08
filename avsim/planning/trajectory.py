@@ -130,6 +130,14 @@ class LatticeConfig:
     #: Candidates leaving the corridor passed to :meth:`FrenetLatticePlanner.plan`
     #: are rejected, so widening the sampling does not widen what is allowed.
     lateral_offsets: tuple[float, ...] = (-3.5, -1.75, -0.9, -0.4, 0.0, 0.4, 0.9, 1.75, 3.5)
+    #: Manoeuvre durations sampled during ordinary driving.
+    #:
+    #: The short end is deliberately absent here.  Risk is evaluated only over a
+    #: candidate's own horizon, so a 1.5 s candidate at 15 m/s stops 15 m short
+    #: of an obstacle, never sees it, and wins on the time term -- the planner
+    #: becomes myopic exactly where it must not be.  Short horizons are supplied
+    #: by the caller (see ``AutonomyConfig.manoeuvre_min_horizon``) only while a
+    #: *commanded* manoeuvre has a deadline to meet.
     horizons: tuple[float, ...] = (2.5, 3.5, 4.5)
     speed_samples: tuple[float, ...] = (-2.0, -1.0, 0.0)
     dt: float = 0.1
@@ -140,6 +148,19 @@ class LatticeConfig:
     w_speed: float = 2.5
     w_time: float = 0.4
     w_risk: float = 60.0
+    #: Penalty on changing the chosen lateral offset between replans.
+    #:
+    #: Candidates a few tenths of a metre apart routinely score within noise of
+    #: each other, so without this the planner picks a different one every tick.
+    #: The reference then jerks sideways at the replan rate, the MPC chases it,
+    #: and a manoeuvre that is comfortable in any single plan violates the
+    #: lateral-acceleration constraint in the sequence of them.
+    #:
+    #: It must stay **below** ``w_offset``: its job is to break ties between
+    #: candidates a few tenths apart, not to argue with a commanded manoeuvre.
+    #: At 25 against an offset weight of 4 it vetoes every lane change, and the
+    #: vehicle drives into the obstacle it was told to go around.
+    w_consistency: float = 2.0
 
     a_lat_limit: float = 4.4
     a_lon_max: float = 3.0
@@ -163,6 +184,7 @@ class FrenetLatticePlanner:
         #: the ego box is centred ahead of the rear axle, not on it
         self._ego_body_offset = 0.5 * params.length - params.rear_overhang
         self.last_candidates: list[Trajectory] = []
+        self.previous_offset: float | None = None
 
     # --- generation ----------------------------------------------------------
 
@@ -198,6 +220,7 @@ class FrenetLatticePlanner:
         stop_s: float | None = None,
         corridor: tuple[float, float] | None = None,
         a0: float = 0.0,
+        horizons: Sequence[float] | None = None,
     ) -> list[Trajectory]:
         """Build the candidate set for the current situation.
 
@@ -214,7 +237,7 @@ class FrenetLatticePlanner:
         """
         cfg = self.cfg
         out: list[Trajectory] = []
-        for T in cfg.horizons:
+        for T in (horizons if horizons is not None else cfg.horizons):
             t = np.arange(0.0, T + 1e-9, cfg.dt)
             for off in cfg.lateral_offsets:
                 e_target = target_offset + off
@@ -270,6 +293,10 @@ class FrenetLatticePlanner:
                         "offset": cfg.w_offset * (e_target - target_offset) ** 2,
                         "speed": cfg.w_speed * float(np.mean((v - target_speed) ** 2)),
                         "time": cfg.w_time * T,
+                        "consistency": (
+                            0.0 if self.previous_offset is None
+                            else cfg.w_consistency * (e_target - self.previous_offset) ** 2
+                        ),
                     }
                     traj.reject_reason = self._feasibility(traj, corridor)
                     traj.feasible = traj.reject_reason == ""
@@ -373,8 +400,16 @@ class FrenetLatticePlanner:
         stop_s: float | None = None,
         corridor: tuple[float, float] | None = None,
         a0: float = 0.0,
+        horizons: Sequence[float] | None = None,
     ) -> Trajectory | None:
         """Return the lowest-cost feasible, unblocked candidate, or ``None``.
+
+        ``horizons`` overrides the sampled durations.  A *commanded* manoeuvre --
+        a lane change, not a lane-keeping correction -- must finish by a fixed
+        time, not by a horizon that recedes with every replan.  Re-planning a
+        3 s convergence every 0.1 s converges geometrically, not in 3 s, and a
+        lane change ordered 70 m before an obstacle is then still half-done when
+        the vehicle arrives.
 
         ``None`` is a real answer: it means every sampled manoeuvre is either
         dynamically infeasible or collides.  The caller must then fall back --
@@ -382,7 +417,8 @@ class FrenetLatticePlanner:
         trajectory that quietly violates something.
         """
         cands = self.generate(
-            path, s0, e_y0, de_y0, dde_y0, v0, target_speed, target_offset, stop_s, corridor, a0
+            path, s0, e_y0, de_y0, dde_y0, v0, target_speed, target_offset, stop_s, corridor,
+            a0, horizons
         )
         best, best_cost = None, np.inf
         for c in cands:
@@ -396,7 +432,13 @@ class FrenetLatticePlanner:
             if c.feasible and c.cost < best_cost:
                 best, best_cost = c, c.cost
         self.last_candidates = cands
+        self.previous_offset = None if best is None else float(best.target_offset)
         return best
+
+    def reset(self) -> None:
+        """Forget the previous manoeuvre, e.g. between scenario runs."""
+        self.previous_offset = None
+        self.last_candidates = []
 
     def emergency_stop(
         self,

@@ -35,8 +35,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..control.geometric import PurePursuit
 from ..control.mpc import CorridorStage, MPCConfig, StopLineConstraint, VehicleMPC
+from ..core.conventions import wrap_to_pi
 from ..models.params import VehicleParams
 from ..perception.sensor import VisionSensor
 from ..perception.tracker import MultiObjectTracker
@@ -122,6 +122,24 @@ class AutonomyConfig:
     #: instead of tracking a nominal that no longer describes the vehicle.
     replan_reinit_lateral: float = 0.6
     replan_reinit_speed: float = 2.5
+    #: Time allowed to complete a *commanded* lateral manoeuvre [s].  While one
+    #: is in progress the lattice horizons are clipped to the remaining time, so
+    #: the manoeuvre finishes on schedule instead of receding with each replan.
+    #: Below this speed the steering command is **held** rather than updated.
+    #:
+    #: Lecture 2/3, *At Standstill: What Vanishes and What Does Not*: the
+    #: steering column of ``B`` scales with ``v``, so the linearization loses
+    #: rank at rest. The optimizer, seeing almost no steering authority, asks
+    #: for very large angles to achieve very little -- and at 0.3 m/s the plant
+    #: obliges and yaws in place. Holding is the honest response: the model does
+    #: not describe what steering does here, so do not act on it.
+    standstill_speed: float = 0.5
+    manoeuvre_time: float = 3.5
+    #: The manoeuvre horizon is biased *shorter* while one is in progress, but
+    #: never below this: a 3.5 m lane change squeezed into 1.2 s demands 14
+    #: m/s^2 of lateral acceleration, every candidate is rejected as infeasible,
+    #: and the vehicle does not change lane at all.
+    manoeuvre_min_horizon: float = 1.5
     #: Stop this far before the end of the route.  A route is a finite path;
     #: without an explicit stop the planner keeps extrapolating past its end,
     #: where the clamped arc length makes every candidate look infeasible.
@@ -175,7 +193,6 @@ class AutonomyStack:
         self.mpc = mpc or VehicleMPC(
             params, MPCConfig(a_y_max=params.max_lateral_accel(self.cfg.lateral_use))
         )
-        self.fallback_control = PurePursuit(params, use_feedforward=True)
 
         self.lights = lights
         self.signal_group = signal_group
@@ -194,6 +211,7 @@ class AutonomyStack:
         self.tracker.reset()
         self.mpc.reset()
         self.behavior.reset()
+        self.lattice.reset()
         self.rng = np.random.default_rng(self.cfg.seed)
         self._s = 0.0
         self._e_y_prev = 0.0
@@ -204,6 +222,9 @@ class AutonomyStack:
         self._last_traj: Trajectory | None = None
         self._nominal: Trajectory | None = None
         self.reinit_count = 0
+        self._stop_constraint_dropped = False
+        self._offset_target = 0.0
+        self._manoeuvre_deadline = -np.inf
         self.telemetry: list[Telemetry] = []
         self.tracks = []
         self.predictions = []
@@ -270,6 +291,28 @@ class AutonomyStack:
             self.reinit_count += 1
             return e_y_meas, self._de_y, 0.0, v_meas, a_meas
         return e_y, de_y, dde_y, v, a
+
+    def _pursue_trajectory(self, x_rear: np.ndarray, v: float, traj: Trajectory) -> float:
+        """Pure pursuit **on the planned trajectory**, not on the lane centre.
+
+        The fallback exists because the MPC failed, not because the plan did.
+        Steering to the route centreline instead undoes whatever manoeuvre was
+        in progress -- which, during an avoidance, means steering back towards
+        the obstacle. The geometry is the standard rear-axle law
+        ``delta = arctan(2 L sin(alpha) / l_d)``.
+        """
+        l_d = float(np.clip(0.6 * abs(v) + 4.0, 3.0, 20.0))
+        pts = np.column_stack([traj.x, traj.y])
+        d = np.linalg.norm(pts - x_rear[:2], axis=1)
+        idx = int(np.argmax(d >= l_d)) if np.any(d >= l_d) else len(pts) - 1
+        target = pts[idx]
+
+        dx, dy = target[0] - x_rear[0], target[1] - x_rear[1]
+        dist = max(float(np.hypot(dx, dy)), 1e-3)
+        alpha = wrap_to_pi(np.arctan2(dy, dx) - x_rear[2])
+        kappa = 2.0 * np.sin(alpha) / dist
+        return float(np.clip(np.arctan(kappa * self.p.L),
+                             -self.p.actuator.delta_max, self.p.actuator.delta_max))
 
     @property
     def corridor(self) -> tuple[float, float]:
@@ -359,6 +402,23 @@ class AutonomyStack:
             stop_abs = max(route_end, s)
         if self._tick % cfg.profile_every == 0 or stop_abs is not None:
             self._rebuild_profile(v, decision, s, stop_abs)
+        # A change of commanded offset starts a new manoeuvre with its own
+        # deadline, and invalidates the nominal that was heading elsewhere.
+        if abs(decision.lateral_offset - self._offset_target) > 0.5:
+            self._offset_target = float(decision.lateral_offset)
+            self._manoeuvre_deadline = t + cfg.manoeuvre_time
+            self._nominal = None
+            # The previous manoeuvre's offset is no longer the thing to be
+            # consistent with.
+            self.lattice.previous_offset = None
+        horizons = None
+        if t < self._manoeuvre_deadline:
+            remaining = max(self._manoeuvre_deadline - t, cfg.manoeuvre_min_horizon)
+            horizons = tuple(h for h in self.lattice.cfg.horizons if h <= remaining + 1e-9)
+            # As the deadline closes, the shortest sampled horizon is the
+            # remaining time itself -- the manoeuvre must finish, not recede.
+            horizons = horizons or (remaining,)
+
         e_y0, de_y0, dde_y0, v0, a0 = self._plan_seed(e_y, v)
         traj = self.lattice.plan(
             path=self.route,
@@ -373,6 +433,7 @@ class AutonomyStack:
             stop_s=stop_abs,
             corridor=self.corridor,
             a0=a0,
+            horizons=horizons,
         )
         used_fallback_plan = traj is None
         if traj is None:
@@ -392,7 +453,17 @@ class AutonomyStack:
         corridor = self._corridor(ss)
         x0 = np.array([x_rear[0], x_rear[1], x_rear[2], v, delta_actual])
         stop_constraint = None
-        if stop_abs is not None and stop_abs < self.route.length - 1e-6:
+        # An already-violated hard constraint is poison for an augmented
+        # Lagrangian: the multiplier grows without bound, the solve never
+        # converges, and the commanded steering goes wherever the broken
+        # subproblem points.  If the front bumper is already past the line the
+        # constraint is dropped and the cost is left to handle it.
+        front_s = s + (self.p.length - self.p.rear_overhang)
+        self._stop_constraint_dropped = (
+            stop_abs is not None and stop_abs <= front_s + 0.5
+        )
+        if (stop_abs is not None and stop_abs < self.route.length - 1e-6
+                and not self._stop_constraint_dropped):
             th_stop = self.route.heading(stop_abs)
             stop_constraint = StopLineConstraint(
                 point=self.route.position(stop_abs),
@@ -406,7 +477,7 @@ class AutonomyStack:
             # speed error by the MPC step, as an inverse-dynamics command would,
             # turns a 1 m/s error into 8 m/s^2 of braking and makes the fallback
             # more dangerous than the failure it is covering.
-            delta, _ = self.fallback_control(x_rear[0], x_rear[1], x_rear[2], v, self.route, s)
+            delta = self._pursue_trajectory(x_rear, v, traj)
             # Feedforward the trajectory's own acceleration and correct the
             # speed error proportionally.  A pure proportional term with a
             # half-second lookahead under-brakes an emergency stop by roughly a
@@ -418,6 +489,9 @@ class AutonomyStack:
             cmd = np.array([a, delta])
         else:
             cmd = np.array([res.a_cmd, res.delta_cmd])
+
+        if v < cfg.standstill_speed and self._tick > 0:
+            cmd = np.array([cmd[0], float(self._last_cmd[1])])
 
         self._last_cmd = cmd
         self._tick += 1
@@ -436,7 +510,7 @@ class AutonomyStack:
                 used_fallback_control=used_fallback_control,
                 trajectory_offset=float(traj.target_offset),
                 stop_s=stop_abs,
-                detail=dict(decision.detail),
+                detail=dict(decision.detail, stop_constraint_dropped=self._stop_constraint_dropped),
             )
         )
         return cmd

@@ -222,6 +222,13 @@ class World:
         for _ in range(self.plant_substeps):
             z = self.plant.sanitize(self.integrator.step(f, z, u, h))
         self.ego = z
+        # Refresh the diagnostics at the *accepted* state.  During the step they
+        # were last written by an internal Runge-Kutta stage, evaluated at
+        # ``x + h k3`` -- a point that is not on the trajectory and, near
+        # standstill under hard braking, not even physical.  Reading them
+        # produced 8.6 m/s^2 of reported lateral acceleration on a vehicle
+        # standing still.
+        self.plant.derivative(z, u, mu)
 
         actors = [] if self.sync_source is None else self.sync_source.step(self.t, self.dt, self.ego_actor())
         self.t += self.dt
