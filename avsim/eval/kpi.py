@@ -282,7 +282,8 @@ def compute_kpis(
         # Lagrangian fights the v >= 0 bound -- so a "failure" there is a known
         # model limitation rather than a solver defect, and counting it hides
         # the solver's behaviour on the problems it is meant to solve.
-        moving = [r for r in telemetry if r.v >= 0.5 and r.mpc_status != "skipped_at_standstill"]
+        skipped = ("skipped_at_standstill", "launch_below_min_speed")
+        moving = [r for r in telemetry if r.v >= 0.5 and r.mpc_status not in skipped]
         if moving:
             ok = np.mean([r.mpc_status == "converged" and r.mpc_violation < 5e-2 for r in moving])
             add(KPI("solver_success_rate", float(ok), "-", th.min_solver_success, "min",

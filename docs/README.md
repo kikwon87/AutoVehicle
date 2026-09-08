@@ -1,6 +1,6 @@
 # Documentation
 
-* [`design.md`](design.md) — why the code is shaped the way it is: twenty-four
+* [`design.md`](design.md) — why the code is shaped the way it is: twenty-eight
   decisions, each with its alternative and what that alternative costs. Most of
   the entries were written after the alternative had actually been tried and had
   produced a specific, measured failure.

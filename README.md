@@ -32,7 +32,7 @@ avsim suite --out results/                   # everything, with reports and figu
 avsim study                                  # the lecture's five study tasks
 avsim contract                               # the model contract for one manoeuvre
 avsim platform                               # the browser test platform
-pytest -q                                    # 102 tests
+pytest -q                                    # 103 tests
 ```
 
 The core (`avsim.core`, `avsim.models`, `avsim.planning`, `avsim.control`)
@@ -320,38 +320,64 @@ see**, so an occluded vehicle is not scored as a tracker failure.
 
 ## Current status
 
-`avsim suite` on this code, one clean run (a *clean* run matters: the MPC keeps
-a wall-clock budget here, so results shift with machine load — see below):
+### The platform's presets
+
+`avsim platform --headless --preset <key>`, built-in MPC, seed 3, one run each:
+
+| preset | outcome | time to goal | min clearance | red lights | path RMS | RTF | score |
+|---|---|---|---|---|---|---|---|
+| `grid_random` | goal reached | 95.0 s | 1.10 m | 0 | 0.07 m | 2.32 | 63.2 |
+| `unprotected_left` | goal reached | 90.1 s | 1.65 m | 0 | 0.05 m | 0.78 | 65.9 |
+| `right_turn` | goal reached | 84.1 s | 2.14 m | 0 | 0.04 m | 0.87 | 77.5 |
+| `overtake_straight` | goal reached | 96.3 s | 2.39 m | 0 | 0.29 m | 2.85 | 60.7 |
+| `cross_traffic` | goal reached | 62.7 s | 9.39 m | 0 | 0.04 m | 0.99 | 82.5 |
+| `free_drive` | goal reached | 94.1 s | inf | 0 | 0.00 m | 0.55 | 81.5 |
+
+Every preset completes its mission with no collision and no signal violation.
+The scores are not marks out of a hundred so much as a starting position for an
+argument: they are what the *default* weights say, and the weights are the part
+of the platform the user is meant to change.
+
+The remaining weakness is visible in the table: **RTF above 1 in traffic**.
+The controller has no wall-clock budget here (design decision 18), so a tick
+with several tracked obstacles costs 200-300 ms against a 100 ms period. That is
+measured and scored rather than hidden, which is the honest arrangement for a
+bench — but it is a real cost, and the compute category is where the built-in
+MPC loses points to a simpler controller.
+
+### The scenario suite
+
+`avsim suite` runs the lecture-derived acceptance scenarios against fixed KPI
+bounds. On a clean machine it passes 8-9 of 13; the variation is not noise in
+the physics but the MPC's wall-clock budget, which this suite keeps and which
+makes the number of solver iterations depend on machine load.
 
 | scenario | verdict | note |
 |---|---|---|
-| `lane_keeping` | PASS | 0.00 m settled cross-track at 16 m/s |
-| `curved_lane_keeping` | PASS | 0.06 m RMS on a 300 m radius |
-| `static_obstacle` | PASS | finds the go-around homotopy |
-| `blocked_single_lane` | PASS | stops short with no room to pass |
-| `lead_braking` | PASS | |
-| `cut_in` | PASS | |
-| `low_mu_curve` | FAIL | hairline: 5.084 m/s² against a 5 m/s² bound |
+| `lane_keeping`, `curved_lane_keeping` | PASS | 0.00 / 0.06 m settled cross-track |
+| `static_obstacle` | borderline | fallback fraction 0.107 against 0.1; passes on a quieter machine |
+| `blocked_single_lane`, `lead_braking`, `cut_in` | PASS | |
+| `low_mu_curve` | FAIL | hairline: 5.084 m/s² against 5 |
 | `signal_green` / `signal_red` / `signal_yellow_dilemma` | PASS | stops **at** the line, including the dilemma-zone decision |
 | `tight_right_turn` | FAIL | jerk 5.95 against 5.5 on a 5.75 m radius |
-| `unprotected_left` | FAIL | completes; 0.62 m cross-track RMS against 0.5 |
-| `cross_traffic` | FAIL | completes; 0.59 m cross-track RMS against 0.35 |
+| `unprotected_left`, `cross_traffic` | FAIL | complete the manoeuvre; cross-track 0.48-0.56 m against 0.4 |
 
-Three things this table is honestly saying.
+Three things this is honestly saying.
 
 **The signal scenarios now stop where they were asked to.** They passed before
 by accident: a stop decision capped the whole velocity profile at zero, so the
 vehicle braked immediately and came to rest 55 m short of the line. That is a
 pass on red-light compliance and a failure at driving, and it made the grid
 routes of the test platform — where the car must actually reach the
-intersection — impossible. Fixing it (decisions 23–24) exposed two further
-defects that the early stop had been hiding: near standstill the lattice could
-not plan a lateral correction at all, and the "holding a stop" test skipped the
-solve on every departure (decisions 25–26).
+intersection — impossible. Fixing it (decisions 23-24) exposed three further
+defects the early stop had been hiding: near standstill the lattice could not
+plan a lateral correction at all, the "holding a stop" test skipped the solve on
+every departure, and the MPC was being asked to solve a degenerate problem at
+walking pace (decisions 25-27).
 
 **`unprotected_left` and `cross_traffic` are the cost of that fix, and they are
 tracking failures rather than behaviour failures.** Both complete the manoeuvre
-and neither collides. The RMS comes from a ~1 m lateral excursion during the
+and neither collides. The RMS comes from a lateral excursion during the
 emergency stop the oncoming vehicle provokes, recovered over the following 10 m.
 Before the change, both passed while stopping short of the intersection they
 were supposed to enter.
@@ -361,9 +387,9 @@ were supposed to enter.
 doing its job, and moving a threshold to cover a number it was written to catch
 is how a test suite stops meaning anything.
 
-The platform's own presets (`avsim platform --headless`) run the same stack
-without the wall-clock budget, which makes them bit-reproducible: two runs of
-`free_drive` agree exactly on time-to-goal, red-light violations and distance.
+Platform runs carry no wall-clock budget and are therefore bit-reproducible:
+two runs of `free_drive` agree exactly on time-to-goal, red-light violations and
+distance.
 
 ---
 

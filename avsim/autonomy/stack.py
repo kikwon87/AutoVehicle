@@ -150,6 +150,18 @@ class AutonomyConfig:
     #: obliges and yaws in place. Holding is the honest response: the model does
     #: not describe what steering does here, so do not act on it.
     standstill_speed: float = 0.5
+    #: Below this speed the MPC is not asked to solve at all [m/s].
+    #:
+    #: The prediction model is degenerate near rest -- the steering column of
+    #: ``B`` vanishes -- and the augmented Lagrangian spends hundreds of
+    #: milliseconds fighting the ``v >= 0`` bound.  Measured pulling away in
+    #: traffic: 200-600 ms per tick, with one solve at 1.5 s, while the vehicle
+    #: crept at 0.1 m/s.  Below ``launch_speed`` the command is the plan's own
+    #: acceleration plus geometric steering, which is what the answer is anyway
+    #: at walking pace, and the loop stays real time without a wall-clock budget.
+    launch_speed: float = 1.5
+    #: Jerk limit on the launch controller's command [m/s^3].
+    launch_jerk: float = 8.0
     manoeuvre_time: float = 3.5
     #: The manoeuvre horizon is biased *shorter* while one is in progress, but
     #: never below this: a 3.5 m lane change squeezed into 1.2 s demands 14
@@ -561,8 +573,29 @@ class AutonomyStack:
         # again.  Measured: stationary for the last 34 s of an unprotected left,
         # with the lattice returning plans and the MPC converging the whole time.
         holding = float(np.max(traj.v)) < cfg.standstill_speed
-        if v < cfg.standstill_speed and holding and self._tick > 0:
-            cmd = np.array([float(traj.a[0]), float(self._last_cmd[1])])
+        if v < cfg.launch_speed and self._tick > 0:
+            # Two cases, one regime.  Holding a stop, the command is the plan's
+            # own acceleration and the steering is frozen: turning the wheels of
+            # a stationary car is scrub, not control.  Pulling away, the command
+            # is the plan's acceleration with a proportional speed correction
+            # and geometric steering -- which is what an optimizer would return
+            # at walking pace anyway, for a hundredth of the compute.
+            if v < cfg.standstill_speed and holding:
+                cmd = np.array([float(traj.a[0]), float(self._last_cmd[1])])
+                status = "skipped_at_standstill"
+            else:
+                idx = min(int(0.5 / max(traj.t[1] - traj.t[0], 1e-3)), len(traj.v) - 1)
+                a = float(np.clip(float(traj.a[0]) + 1.5 * (float(traj.v[idx]) - v),
+                                  self.p.actuator.a_min, self.p.actuator.a_max))
+                # Rate-limit it.  Handing over between two controllers with
+                # different ideas about the current acceleration is a step in
+                # the command, and a step in acceleration is unbounded jerk:
+                # measured at 24 m/s^3 on an unprotected left, against a KPI
+                # bound of 8.  The limit is the bound.
+                step = cfg.launch_jerk * cfg.control_dt
+                a = float(np.clip(a, self._last_cmd[0] - step, self._last_cmd[0] + step))
+                cmd = np.array([a, self._pursue_trajectory(x_rear, v, traj)])
+                status = "launch_below_min_speed"
             self._last_cmd = cmd
             self._tick += 1
             self.telemetry.append(
@@ -572,7 +605,7 @@ class AutonomyStack:
                     target_speed=decision.target_speed, ref_speed=plan_speed,
                     n_detections=len(detections), n_tracks=len(self.tracks),
                     n_predictions=len(self.predictions),
-                    mpc_status="skipped_at_standstill", mpc_time=0.0,
+                    mpc_status=status, mpc_time=0.0,
                     mpc_violation=0.0, mpc_iterations=0,
                     a_cmd=float(cmd[0]), delta_cmd=float(cmd[1]),
                     used_fallback_plan=used_fallback_plan, used_fallback_control=False,

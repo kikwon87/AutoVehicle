@@ -29,6 +29,7 @@ from avsim.platform.presets import PRESETS
 from avsim.platform.scoring import DEFAULT_METRICS, MetricSpec, ScoreConfig, compare, score_run
 from avsim.platform.session import RunConfig, RunSession
 from avsim.world.grid import GridLayout, grid_network, node_id
+from avsim.world.actors import ActorState
 from avsim.world.grid_traffic import ForcedVehicle, GridTrafficSource, TrafficConfig
 
 
@@ -102,6 +103,31 @@ def test_random_traffic_drives_without_colliding():
                 min_gap = min(min_gap, polygon_distance(boxes[i], boxes[j]))
     assert min_gap > 0.0, "traffic vehicles overlapped"
     assert moving_seen and stopped_seen, "traffic should both drive and wait"
+
+
+def test_traffic_brakes_for_a_stopped_ego():
+    """The ego is one more obstacle, not an invisible one.
+
+    Traffic knows nothing about the ego's route, so it sees it geometrically.
+    Without that it drives through a vehicle stopped at a red light, and a
+    safety KPI computed from that collision measures nothing.
+    """
+    layout = grid_network()
+    forced = ForcedVehicle(node="n1_1", direction="W", plan=("straight",), s0=10.0, v=12.0)
+    source = GridTrafficSource(layout, TrafficConfig(n_vehicles=0), seed=1, forced=[forced])
+    follower = source.step(0.1, 0.1)[0]
+
+    # Park the ego 25 m ahead of it, in its lane, facing the same way.
+    c, s_ = math.cos(follower.psi), math.sin(follower.psi)
+    ego = ActorState(id="ego", x=follower.x + 25.0 * c, y=follower.y + 25.0 * s_,
+                     psi=follower.psi, v=0.0, length=4.5, width=1.8)
+
+    gap = math.inf
+    for k in range(1, 120):
+        state = source.step(0.1 * k, 0.1, ego)[0]
+        gap = math.hypot(ego.x - state.x, ego.y - state.y) - 0.5 * (ego.length + state.length)
+    assert gap > 0.0, "traffic drove into a stationary ego"
+    assert state.v < 1.0, "traffic did not slow for a stationary ego"
 
 
 def test_forced_vehicles_start_where_the_preset_puts_them():

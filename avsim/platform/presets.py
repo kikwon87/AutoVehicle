@@ -141,13 +141,18 @@ def _presets() -> dict[str, Preset]:
             "or follow it to the next intersection."
         ),
         focus="Manoeuvre choice: the lattice must find the go-around, not just brake.",
-        grid=GridSpec(n_lanes=2, spacing=190.0, arm_length=160.0),
-        ego=EgoSpec(node=WEST_MID, direction="E", plan=("straight", "straight"),
-                    start_speed=15.0),
-        duration=110.0,
-        traffic=TrafficConfig(n_vehicles=6, v0_min=6.0, v0_max=10.0),
+        # One intersection, long arms and light background traffic.  The
+        # scenario is the pass, and a route across two more signalized boxes
+        # measures how long the ego waits at red lights instead -- on the first
+        # version of this preset the ego spent 35 s of a 110 s run stopped at a
+        # light and never reached the slow vehicle at all.
+        grid=GridSpec(n_lanes=2, spacing=190.0, arm_length=220.0),
+        ego=EgoSpec(node=WEST_MID, direction="E", plan=("straight",),
+                    start_speed=13.0),
+        duration=120.0,
+        traffic=TrafficConfig(n_vehicles=3, v0_min=6.0, v0_max=10.0),
         forced=(
-            ForcedVehicle(node=WEST_MID, direction="E", plan=("straight", "straight"),
+            ForcedVehicle(node=WEST_MID, direction="E", plan=("straight",),
                           s0=95.0, v=5.0, v0=5.0, id="slow1"),
         ),
     )

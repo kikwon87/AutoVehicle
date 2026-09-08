@@ -197,6 +197,39 @@ class GridTrafficSource(SyncSource):
             out.setdefault(lane, []).append((a, s_local))
         return out
 
+    def _ego_gap(
+        self, actor: TrafficActor, ego: ActorState | None
+    ) -> tuple[float, float] | None:
+        """Gap and closing rate to the **ego**, if it is in this actor's way.
+
+        Traffic knows nothing about the ego's route, so this is geometric rather
+        than lane-based: the ego's position in the actor's own frame, against a
+        corridor wide enough to cover it at any orientation.  The leader speed is
+        the ego's velocity *along the actor's heading*, which makes a crossing
+        vehicle read as a slow obstacle and a stopped one as a wall.
+
+        Without it the ego is invisible to the traffic model and gets rear-ended
+        while stopped at a red light -- which is not a failure of the ego's
+        driving, and scoring it as one makes every safety number meaningless.
+        """
+        if ego is None:
+            return None
+        c, s_ = np.cos(actor._psi), np.sin(actor._psi)
+        dx, dy = ego.x - actor._x, ego.y - actor._y
+        forward = dx * c + dy * s_
+        lateral = -dx * s_ + dy * c
+        if forward <= 0.0:
+            return None
+        # Half-width that covers the ego whatever way it is pointing.
+        half = 0.5 * actor.width + 0.5 * float(np.hypot(ego.length, ego.width))
+        if abs(lateral) > half:
+            return None
+        gap = forward - 0.5 * (actor.length + ego.length)
+        if gap > self.cfg.yield_lookahead * 1.5:
+            return None
+        v_along = float(ego.v) * float(np.cos(ego.psi - actor._psi))
+        return max(gap, 0.05), actor.v - max(v_along, 0.0)
+
     def _leader_gap(
         self, actor: TrafficActor, occupancy: dict[str, list[tuple[TrafficActor, float]]]
     ) -> tuple[float | None, float]:
@@ -314,6 +347,9 @@ class GridTrafficSource(SyncSource):
             yield_gap = self._right_of_way_gap(actor)
             if yield_gap is not None and (gap is None or yield_gap < gap):
                 gap, dv = yield_gap, actor.v
+            ego_gap = self._ego_gap(actor, ego)
+            if ego_gap is not None and (gap is None or ego_gap[0] < gap):
+                gap, dv = ego_gap
             out.append(actor.step(dt, t, gap, dv, self.signals))
 
         finished = [a for a in self._actors if a.done]

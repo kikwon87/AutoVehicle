@@ -109,6 +109,8 @@ class MPCController(Controller):
         return {
             "behavior": r.behavior,
             "reason": r.reason,
+            "lateral_offset": r.trajectory_offset,
+            "stop_s": "-" if r.stop_s is None else round(float(r.stop_s), 1),
             "mpc_status": r.mpc_status,
             "mpc_time": r.mpc_time,
             "solver_iterations": r.mpc_iterations,

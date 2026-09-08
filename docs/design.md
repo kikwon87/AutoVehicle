@@ -407,3 +407,43 @@ The test is now the plan's *maximum* speed over its horizon, which is what
 "intends to stay stopped" actually means. The lesson is narrow and worth
 keeping: a predicate about intent must be evaluated over the interval the
 intent covers.
+
+---
+
+## 27. Below walking pace the optimizer is not asked
+
+Decision 17 skipped the MPC while the vehicle was stopped *and* meant to stay
+stopped. That leaves the departure and the last metre of an approach — the
+regime where the prediction model is most degenerate — being solved by the
+optimizer at 200-600 ms a tick, with one measured solve at 1.5 s, while the
+vehicle crept at 0.1 m/s and the loop was five times slower than real time.
+
+Below `launch_speed` (1.5 m/s) the command is now the plan's own acceleration
+with a proportional speed correction, and geometric steering. That is what an
+optimizer returns at walking pace anyway, for a hundredth of the compute, and
+it keeps the loop real time without a wall-clock budget.
+
+The handover needs a rate limit. Two controllers with different ideas about the
+current acceleration produce a step in the command, and a step in acceleration
+is unbounded jerk — measured at 24 m/s³ against a KPI bound of 8. The launch
+controller's command is limited to `launch_jerk`, and the bound is the KPI's.
+
+---
+
+## 28. The ego is one more obstacle to the traffic, not an invisible one
+
+The grid traffic followed its own leaders, obeyed its own signals and reserved
+the intersection box, and did not know the ego existed. So it drove through it:
+the default preset ended in a collision at 28 s with the ego stationary at a red
+light and a traffic vehicle arriving at 3 m/s from behind.
+
+That collision is not a fact about the ego's driving, and a safety KPI computed
+from it measures nothing at all. Traffic now sees the ego geometrically —
+position in the actor's own frame, against a corridor wide enough to cover the
+ego at any orientation, with the leader speed taken as the ego's velocity
+*along the actor's heading*, so a crossing vehicle reads as a slow obstacle and
+a stopped one as a wall. Geometric rather than lane-based, because traffic knows
+nothing about the ego's route and should not have to.
+
+It remains a car-following rule, not cooperation: traffic will brake for the ego
+in its path and will not otherwise get out of its way.
