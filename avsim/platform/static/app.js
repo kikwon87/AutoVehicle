@@ -315,14 +315,28 @@ const cv = $("view");
 const ctx = cv.getContext("2d");
 let view = { scale: 1, ox: 0, oy: 0 };
 
-function fitView(bounds) {
-  const w = bounds.xmax - bounds.xmin, h = bounds.ymax - bounds.ymin;
+/* Two views of the same world.  Whole-network is where the run is; ego-centred
+ * is where the *driving* is -- at 760 m across, a 4.5 m car is four pixels and
+ * a lane change is invisible. */
+function fitBox(xmin, xmax, ymin, ymax) {
+  const w = xmax - xmin, h = ymax - ymin;
   const scale = Math.min(cv.width / w, cv.height / h);
   view = {
     scale,
-    ox: -bounds.xmin * scale + (cv.width - w * scale) / 2,
-    oy: bounds.ymax * scale + (cv.height - h * scale) / 2,
+    ox: -xmin * scale + (cv.width - w * scale) / 2,
+    oy: ymax * scale + (cv.height - h * scale) / 2,
   };
+}
+
+function fitView(frame) {
+  if ($("follow").checked && frame) {
+    const span = Number($("zoom").value);
+    const half = span / 2;
+    fitBox(frame.ego.x - half, frame.ego.x + half, frame.ego.y - half, frame.ego.y + half);
+  } else {
+    const b = scene.bounds;
+    fitBox(b.xmin, b.xmax, b.ymin, b.ymax);
+  }
 }
 const X = (x) => x * view.scale + view.ox;
 const Y = (y) => -y * view.scale + view.oy;
@@ -339,7 +353,7 @@ function drawEmpty() {
 
 function draw(frame) {
   if (!scene) return;
-  fitView(scene.bounds);
+  fitView(frame);
   ctx.fillStyle = "#0c0f15";
   ctx.fillRect(0, 0, cv.width, cv.height);
 
@@ -779,6 +793,16 @@ function wire() {
   $("btn-batch").onclick = openBatch;
   $("batch-close").onclick = () => $("batch-modal").classList.add("hidden");
   $("batch-run").onclick = runBatch;
+
+  const zoom = $("zoom");
+  const redraw = () => {
+    $("zoom-label").textContent = zoom.value + " m";
+    zoom.disabled = !$("follow").checked;
+    if (lastFrame) draw(lastFrame);
+  };
+  zoom.oninput = redraw;
+  $("follow").onchange = redraw;
+  redraw();
 
   const n = $("n_vehicles"), slider = $("n_vehicles_slider");
   n.oninput = () => (slider.value = n.value);

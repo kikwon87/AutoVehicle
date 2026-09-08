@@ -192,3 +192,14 @@ tr.crashed td { color: var(--bad); }
 .checks { display: grid; gap: 3px; max-height: 190px; overflow: auto; }
 .checks label { display: flex; gap: 6px; align-items: center; font-size: 11px; }
 .checks input { width: auto; }
+
+.view-controls {
+  position: absolute; right: 10px; top: 8px;
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(12,15,21,.8); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 8px; font-size: 11px; color: var(--ink-dim);
+}
+.view-controls label { display: flex; align-items: center; gap: 5px; }
+.view-controls input[type=checkbox] { width: auto; }
+.view-controls input[type=range] { width: 120px; }
+.view-controls span { min-width: 44px; text-align: right; font-variant-numeric: tabular-nums; }

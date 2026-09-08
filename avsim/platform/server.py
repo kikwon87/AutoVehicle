@@ -31,6 +31,7 @@ and it is the question the platform exists for.
 from __future__ import annotations
 
 import json
+import math
 import mimetypes
 import threading
 import traceback
@@ -41,6 +42,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+import numpy as np
 
 from ..models.params import REFERENCE_VEHICLE
 from .controller_api import CONTRACT_VERSION, ControllerLoadError, load_controller
@@ -187,7 +190,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _json(self, payload: Any, status: int = 200) -> None:
-        body = json.dumps(payload, default=_encode).encode("utf-8")
+        body = json.dumps(_finite(payload), default=_encode).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -200,6 +203,11 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
     def _static(self, path: str) -> None:
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         name = "index.html" if path in ("/", "") else path.lstrip("/")
         target = (STATIC / name).resolve()
         if not str(target).startswith(str(STATIC.resolve())) or not target.is_file():
@@ -352,6 +360,34 @@ class _Box:
         self.total = float(d.get("total", 0.0))
         self.categories = d.get("categories", {})
         self.collided = bool(d.get("collided", False))
+
+
+def _finite(obj: Any):
+    """Replace every non-finite float in a payload with ``null``.
+
+    ``json.dumps`` writes ``Infinity`` for ``float('inf')``, which is valid
+    Python and **invalid JSON**: ``JSON.parse`` rejects it and the whole page
+    fails to start.  It is not a hypothetical -- an understeering car has an
+    infinite critical speed, so the very first ``/api/bootstrap`` carries one.
+
+    Infinity is meaningful here (no vehicle was ever near, the goal was never
+    reached), so it is sent as ``null`` and the client decides what that means
+    per field, rather than being clamped to a number that would read as data.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite(v) for v in obj]
+    if isinstance(obj, np.floating):
+        v = float(obj)
+        return v if math.isfinite(v) else None
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.ndarray):
+        return _finite(obj.tolist())
+    return obj
 
 
 def _encode(o: Any):
