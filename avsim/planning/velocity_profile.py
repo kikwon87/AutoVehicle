@@ -103,6 +103,7 @@ def build_velocity_profile(
     v_start: float | None = None,
     s_end: float | None = None,
     curvature_lookahead: float = 0.0,
+    decel_use: float | None = None,
 ) -> VelocityProfile:
     """Build ``v(s)`` for a path.
 
@@ -112,6 +113,14 @@ def build_velocity_profile(
     ``lateral_use = 0.5``.  Leaving headroom is not timidity: the plan is
     executed by a controller that has its own tracking error, and a plan at
     100% of ``mu`` has nothing left for it.
+
+    ``decel_use`` is the fraction of ``mu g`` the **backward** pass may spend,
+    separately from ``longitudinal_use``.  Planning a stop at the friction limit
+    means braking begins at the last metre at which it is possible, so any
+    tracking lag at all overshoots the line: at 13.9 m/s the vehicle starts
+    braking 18 m out, needs 18.2 m, and runs the light.  A planned stop should
+    be comfortable; the limit belongs to the emergency stop, which is a
+    different code path.
 
     ``curvature_lookahead`` widens the curvature used at each point to the
     maximum over a window ahead, which anticipates the step in ``kappa`` where a
@@ -124,7 +133,10 @@ def build_velocity_profile(
 
     a_lat_max = params.max_lateral_accel(lateral_use)
     a_lon_max = min(longitudinal_use * params.mu * 9.80665, params.actuator.a_max)
-    a_lon_min = max(-longitudinal_use * params.mu * 9.80665, params.actuator.a_min)
+    a_lon_min = max(
+        -(longitudinal_use if decel_use is None else decel_use) * params.mu * 9.80665,
+        params.actuator.a_min,
+    )
 
     kappa = np.array([abs(path.curvature(si)) for si in s])
     if curvature_lookahead > 0:

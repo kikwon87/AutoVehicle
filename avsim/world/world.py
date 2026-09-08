@@ -150,7 +150,10 @@ class World:
     def signal_states(self) -> dict[str, str]:
         if self.lights is None:
             return {}
-        return {g: self.lights.state(g, self.t).value for g in ("NS", "EW")}
+        # A single-intersection controller has the implicit groups NS and EW; a
+        # grid controller enumerates its own, one pair per node.
+        groups = getattr(self.lights, "groups", ("NS", "EW"))
+        return {g: self.lights.state(g, self.t).value for g in groups}
 
     def signal_for_approach(self, approach: str) -> SignalState:
         if self.lights is None:

@@ -110,7 +110,8 @@ class ReferencePath:
     def sample(self, ds: float = 0.5) -> np.ndarray:
         """Uniformly sampled polyline ``(N, 2)`` for rendering and collision tests."""
         n = max(int(self.length / ds) + 1, 2)
-        return np.array([self.position(s) for s in np.linspace(0.0, self.length, n)])
+        x, y, _, _ = self.frames(np.linspace(0.0, self.length, n))
+        return np.column_stack([x, y])
 
     def project(self, x: float, y: float, s_guess: float | None = None, window: float = 25.0) -> float:
         """Arc length of the closest path point, searched near ``s_guess``.
@@ -127,8 +128,16 @@ class ReferencePath:
         if hi <= lo:
             return float(np.clip(s_guess or 0.0, 0.0, self.length))
 
+        # The coarse scan goes through the cached table rather than through
+        # ``position`` per sample.  A 25 m window at 0.25 m is 200 samples, and
+        # a planning tick projects tens of points onto the same path -- as a
+        # Python loop that is by far the most expensive thing in the stack, and
+        # as three ``np.interp`` calls it is free.  Accuracy is unaffected: the
+        # scan only chooses which basin the Newton iteration below starts in,
+        # and the table's spacing is the scan's spacing.
         grid = np.linspace(lo, hi, max(int((hi - lo) / 0.25) + 2, 8))
-        d2 = np.array([float(np.sum((p - self.position(s)) ** 2)) for s in grid])
+        gx, gy, _, _ = self.frames(grid)
+        d2 = (p[0] - gx) ** 2 + (p[1] - gy) ** 2
         s = float(grid[int(np.argmin(d2))])
 
         for _ in range(12):
@@ -145,7 +154,10 @@ class ReferencePath:
             ds = -g / H
             ds = float(np.clip(ds, -1.0, 1.0))
             s_new = float(np.clip(s + ds, 0.0, self.length))
-            if abs(s_new - s) < 1e-10:
+            # A tenth of a micron is converged by any standard this simulation
+            # cares about; iterating to 1e-10 only bought more scalar segment
+            # lookups, three per iteration, on the hottest call in the stack.
+            if abs(s_new - s) < 1e-7:
                 s = s_new
                 break
             s = s_new

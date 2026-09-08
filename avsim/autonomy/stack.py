@@ -32,6 +32,7 @@ layer counts them.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Sequence
 
 import numpy as np
 
@@ -107,6 +108,19 @@ class AutonomyConfig:
     #: Headroom the lattice's feasibility check allows above the planned budget.
     lateral_margin: float = 1.2
     longitudinal_use: float = 0.6
+    #: Fraction of ``mu g`` a *planned* deceleration may use.
+    #:
+    #: Much lower than ``longitudinal_use``, and for a reason that is about the
+    #: optimizer rather than about comfort.  A stop planned at ``b`` begins
+    #: ``v^2 / 2b`` before the line: at 0.6 mu g that is 18 m from 13.9 m/s, at
+    #: 0.35 it is 31 m -- and the MPC's horizon is 3 s, about 42 m.  Unless
+    #: braking starts *outside* that horizon the optimizer first sees the stop
+    #: line as a constraint it is already too fast to satisfy, reports a
+    #: violation, and hands over to the fallback. At 0.22 mu g braking begins
+    #: 50 m out and the optimizer inherits a reference that is already slowing.
+    #: The emergency stop still uses the full friction limit; that is a
+    #: different code path and a different question.
+    decel_use: float = 0.22
     #: replan the velocity profile every this many control ticks
     profile_every: int = 5
     use_lane_predictor: bool = True
@@ -166,6 +180,7 @@ class AutonomyStack:
         lights: TrafficLightController | None = None,
         signal_group: str | None = None,
         stop_line_s: float | None = None,
+        route_signals: Sequence[tuple[float, str]] | None = None,
         crossing_conflict: bool = False,
     ):
         self.p = params
@@ -205,8 +220,17 @@ class AutonomyStack:
         )
 
         self.lights = lights
-        self.signal_group = signal_group
-        self.stop_line_s = stop_line_s
+        #: Every signalized stop line along the route, as
+        #: ``(arc length, signal group)``, sorted.  A single stop line is the
+        #: degenerate case; a route across a grid crosses several, and a stack
+        #: that can only hold one obeys the first light and runs every one after
+        #: it.
+        if route_signals is not None:
+            self.route_signals = sorted((float(s_), str(g)) for s_, g in route_signals)
+        elif stop_line_s is not None and signal_group is not None:
+            self.route_signals = [(float(stop_line_s), str(signal_group))]
+        else:
+            self.route_signals = []
         self.crossing_conflict = crossing_conflict
 
         self.rng = np.random.default_rng(self.cfg.seed)
@@ -241,6 +265,18 @@ class AutonomyStack:
 
     # --- pipeline ------------------------------------------------------------
 
+    def next_signal(self, s: float) -> tuple[float | None, str | None]:
+        """The next signalized stop line at or ahead of ``s``.
+
+        A stop line is "ahead" until the vehicle is a metre past it, which is
+        the point at which it is committed into the box and the light behind it
+        no longer applies.
+        """
+        for stop_s, group in self.route_signals:
+            if stop_s > s - 1.0:
+                return stop_s, group
+        return None, None
+
     def _localize(self, x_rear: np.ndarray) -> tuple[float, float]:
         s = self.route.project(x_rear[0], x_rear[1], s_guess=self._s)
         e_y = self.route.lateral_offset(x_rear[0], x_rear[1], s)
@@ -250,7 +286,12 @@ class AutonomyStack:
     def _rebuild_profile(self, v_now: float, decision: BehaviorDecision, s: float, stop_s: float | None = None):
         constraints = []
         stop_s = decision.stop_s if stop_s is None else stop_s
-        for bound, kind in ((stop_s, "stop"), (decision.safety_bound_s, "safety")):
+        # ``stop_s`` is where the **nose** must not pass; the profile's arc
+        # length is the **rear axle**.  The two differ by the front overhang,
+        # and using one for the other either parks the nose across the line or
+        # stops the car a car-length short of it.
+        for bound, kind in ((self._rear_axle_stop(stop_s), "stop"),
+                            (self._rear_axle_stop(decision.safety_bound_s), "safety")):
             if bound is not None:
                 # Both become a zero-speed point in the profile; the backward
                 # pass then turns them into the speed ceiling
@@ -260,16 +301,32 @@ class AutonomyStack:
                     SpeedConstraint(s=float(max(bound, s)), v_max=0.0,
                                     label=f"{kind}: {decision.reason}")
                 )
+        # A stop is expressed by the stop *point*, not by a cruise cap of zero.
+        # Capping the whole profile at the behaviour's target speed made a
+        # "stop at the line" decision mean "stop wherever you are": the vehicle
+        # braked immediately and came to rest 55 m short of a line it had 90 m
+        # to reach.  The backward pass turns the stop point into the speed
+        # ceiling sqrt(2 b (s_stop - s)), which is the thing that was wanted.
+        cap = float(decision.target_speed)
+        if stop_s is not None and cap <= 0.1:
+            cap = self.cfg.speed_limit
         self._profile = build_velocity_profile(
             self.route,
             self.p,
-            v_limit=min(decision.target_speed, self.cfg.speed_limit),
+            v_limit=min(cap, self.cfg.speed_limit),
             constraints=constraints,
             v_start=v_now,
             lateral_use=self.cfg.lateral_use,
             longitudinal_use=self.cfg.longitudinal_use,
+            decel_use=self.cfg.decel_use,
             curvature_lookahead=15.0,
         )
+
+    def _rear_axle_stop(self, stop_s: float | None) -> float | None:
+        """A nose-limit arc length as the rear-axle arc length that produces it."""
+        if stop_s is None:
+            return None
+        return float(stop_s - (self.p.length - self.p.rear_overhang))
 
     def _plan_seed(self, e_y_meas: float, v_meas: float) -> tuple[float, float, float, float, float]:
         """Lateral, speed and acceleration state the lattice should plan from.
@@ -353,13 +410,26 @@ class AutonomyStack:
         x_rear: np.ndarray,
         delta_actual: float,
         actors: list[ActorState],
+        tracks: list | None = None,
     ) -> np.ndarray:
-        """Advance the stack one control tick; returns ``[a_cmd, delta_cmd]``."""
+        """Advance the stack one control tick; returns ``[a_cmd, delta_cmd]``.
+
+        ``tracks`` lets a caller that already ran perception -- the test
+        platform, which must hand *identical* observations to every controller
+        it compares -- supply them instead. Running a second sensor and tracker
+        here would give the built-in stack different measurements from the
+        external controller it is being scored against, and the comparison
+        would be of two perception draws rather than of two controllers.
+        """
         cfg = self.cfg
 
         # 1-2. perception
-        detections = self.sensor.observe(ego, actors, self.rng)
-        self.tracks = self.tracker.update(detections)
+        if tracks is None:
+            detections = self.sensor.observe(ego, actors, self.rng)
+            self.tracks = self.tracker.update(detections)
+        else:
+            detections = []
+            self.tracks = list(tracks)
         self.predictions = self.predictor(self.tracks, self.times)
 
         # 3. localization
@@ -372,6 +442,7 @@ class AutonomyStack:
         if self._profile is None:
             self._rebuild_profile(v, BehaviorDecision(BehaviorState.CRUISE, cfg.speed_limit), s)
         s_of_t = self._profile.sample_time_grid(s, self.times)
+        next_stop_s, next_group = self.next_signal(s)
         # Where the ego is *planned* to be, so the conflict check sees the
         # manoeuvre rather than the centerline.
         if self._nominal is not None and self._nominal.t[-1] >= self.times[-1] * 0.5:
@@ -392,8 +463,8 @@ class AutonomyStack:
             ego_path=ego_path,
             predictions=self.predictions,
             speed_limit=cfg.speed_limit,
-            stop_line_s=self.stop_line_s,
-            signal_group=self.signal_group,
+            stop_line_s=next_stop_s,
+            signal_group=next_group,
             lights=self.lights,
             t_now=t,
             box_length=2.0 * (self.network.box_half or 11.0),
@@ -437,10 +508,22 @@ class AutonomyStack:
             de_y0=de_y0,
             dde_y0=dde_y0,
             v0=v0,
-            target_speed=min(decision.target_speed, self._profile.speed_at(s + 5.0)),
+            # Same rule as the velocity profile: a stop is the stop *point*, and
+            # the profile has already turned it into the speed ceiling here.
+            # Passing the behaviour's raw target of zero instead tells the
+            # lattice to be stopped *now*, and the vehicle halts a hundred
+            # metres short of the line it was asked to stop at.
+            target_speed=min(
+                self.cfg.speed_limit
+                if (stop_abs is not None and decision.target_speed <= 0.1)
+                else decision.target_speed,
+                self._profile.speed_at(s + 5.0),
+            ),
             predictions=self.predictions,
             target_offset=decision.lateral_offset,
-            stop_s=stop_abs,
+            # Rear axle again: the lattice ends its stop polynomial at this arc
+            # length, and the arc length it starts from is the rear axle's.
+            stop_s=self._rear_axle_stop(stop_abs),
             corridor=self.corridor,
             a0=a0,
             horizons=horizons,
@@ -469,7 +552,16 @@ class AutonomyStack:
         # the loop real-time without a wall-clock budget, which would make
         # results depend on machine load.
         plan_speed = float(np.interp(0.6, traj.t, traj.v))
-        if v < cfg.standstill_speed and plan_speed < cfg.standstill_speed and self._tick > 0:
+        # "Holding a stop" means the *plan* is to stay stopped, which is a
+        # statement about the whole horizon, not about the next 0.6 s.  A
+        # minimum-jerk pull-away is still under 0.3 m/s after 0.6 s, so testing
+        # the plan there says "stopped" for every departure, the solve is
+        # skipped, the commanded acceleration is the plan's first sample --
+        # which for a min-jerk curve is zero -- and the vehicle never moves
+        # again.  Measured: stationary for the last 34 s of an unprotected left,
+        # with the lattice returning plans and the MPC converging the whole time.
+        holding = float(np.max(traj.v)) < cfg.standstill_speed
+        if v < cfg.standstill_speed and holding and self._tick > 0:
             cmd = np.array([float(traj.a[0]), float(self._last_cmd[1])])
             self._last_cmd = cmd
             self._tick += 1

@@ -31,7 +31,8 @@ avsim run signal_red --plot red.png          # one scenario + a figure
 avsim suite --out results/                   # everything, with reports and figures
 avsim study                                  # the lecture's five study tasks
 avsim contract                               # the model contract for one manoeuvre
-pytest -q                                    # 80 tests
+avsim platform                               # the browser test platform
+pytest -q                                    # 102 tests
 ```
 
 The core (`avsim.core`, `avsim.models`, `avsim.planning`, `avsim.control`)
@@ -54,6 +55,8 @@ avsim/
   autonomy/    stack
   eval/        kpi · scenarios · runner · studies
   viz/         render
+  platform/    controller_api · controllers · parameters · presets
+               scoring · session · server · static/   (the test application)
 ```
 
 The dependency arrow points one way: `world` knows nothing about `planning`,
@@ -74,6 +77,101 @@ the only way to be sure the planner is not cheating.
 
 The world integrates at 20 ms while the stack runs at 100 ms and its command is
 **held** in between — the zero-order hold the whole modelling chapter is about.
+
+---
+
+## The test platform (자율주행 테스트 플랫폼)
+
+```bash
+avsim platform                                  # http://127.0.0.1:8770
+avsim platform --headless --preset unprotected_left --controller mpc
+avsim platform --headless --controller examples/controllers/template_stanley.py --json out.json
+```
+
+A local web application that turns the package into a **bench**: pick a road
+and traffic scenario, set the car up, choose or load a control algorithm, run
+it, and score it against algorithms you ran earlier. Python simulates and
+scores; the browser draws and edits. The server is standard library only, so
+the platform adds no dependency to a package whose core is numpy alone.
+
+### 1 · The road — a 우물 정자 grid
+
+`avsim.world.grid` builds an `n × n` lattice of signalized crossroads (3 × 3 by
+default, 150 m spacing) with per-node two-phase signals that are never green at
+once. `avsim.world.grid_traffic` fills it with **n vehicles you choose**, each
+on a random route through the grid, each following the road rules the lecture's
+IDM and a right-of-way box reservation give it.
+
+They are **not autonomous** and do not cooperate with the ego: they drive as
+they please, stop, queue and set off again. What they will not do is drive into
+each other — the one property the world must have for a *collision* to mean the
+ego caused it. That is asserted, box-to-box, over 900 steps in
+`tests/test_platform.py`.
+
+### 2 · The car — 39 parameters, live
+
+Every entry in `avsim.platform.parameters` is a slider **and** a number box (or
+a list, where a list is the honest control: road surface is offered as
+*dry / wet / snow / ice / race*, because "wet asphalt" is the question a user
+actually has and `mu = 0.6` is the answer). Mass, inertia, axle geometry,
+cornering stiffnesses, the tire model, steering limits and rate, drive and brake
+limits, actuator lags, suspension rates, and the simulation's own periods.
+
+Next to them the platform shows what they *imply* — wheelbase, `K_us`, the
+characteristic and critical speeds, the lateral-acceleration limit, the minimum
+turn radius, the static axle loads, and whether the car is understeering or
+oversteering — recomputed as you drag. A parameter panel that only accepts
+input teaches nothing.
+
+### 3 · The algorithm — built in, or yours
+
+Three controllers ship: the package's own MPC stack, a pure-pursuit + PI
+baseline, and a linear policy with the shape a learned one has. Any `.py` file
+that provides a `control(obs) -> command` object can be loaded beside them, from
+the UI or with `--controller path/to/file.py`.
+
+**`docs/controller_api.md` is the report that makes that possible** — the
+contract in full: every observation field with units and signs, the three
+normalized outputs and their scaling, the loading rules, an ML example, and the
+checklist. It is written to be handed to somebody who has never seen this
+package, and the platform serves it at `/api/report` so it is one click away
+from the run button. Templates to copy live in `examples/controllers/`.
+
+Loading a plug-in **executes it**. That is the intended behaviour — the platform
+exists to run algorithms people write — but a plug-in is exactly as trustworthy
+as its author.
+
+### 4 · The evaluation — KPIs you can argue with
+
+Six presets set up the situations that matter: `grid_random`, `free_drive`,
+`unprotected_left` (비보호 좌회전, with oncoming traffic), `right_turn`,
+`overtake_straight` (2-lane, with a slow vehicle to pass) and `cross_traffic`.
+Each fixes the ego's start, its route, and the other vehicles' count and
+placement, so a car setting × an algorithm is a repeatable measurement.
+
+Sixteen metrics in five categories are recorded: **mission** (time to goal,
+completion, mean speed), **safety** (minimum clearance, minimum TTC, exposure
+time, friction usage, lane departure, red-light violations), **energy**
+(steering travel, pedal travel, tractive energy), **comfort** (peak lateral
+acceleration, jerk, path error) and **compute** (real-time factor).
+
+These have different dimensions and there is no exchange rate between them that
+the platform is entitled to fix. So **every threshold and weight is an input in
+the UI**, and `/api/rescore` re-scores stored runs instantly — asking "what if
+safety mattered three times as much?" costs nothing and never re-runs the
+simulation. A collision is handled separately: zero the run, or subtract a fixed
+penalty, whichever question you are asking.
+
+`Batch` runs presets × controllers × seeds to completion and ranks the results.
+
+> **한국어** — 우물 정자 격자 도로에 n대의 비자율 차량이 무작위 경로로 주행하고
+> (서로 충돌하지는 않으며, 정지 후 재출발함), 39개 차량 동역학 파라미터를 슬라이더·
+> 입력창·선택목록으로 바꿔가며, 내장 MPC/ML 또는 외부 `.py` 제어 알고리즘을 골라
+> 실행하고, 임무·안전·에너지·승차감·연산의 16개 KPI로 종합 점수를 냅니다. 서로 다른
+> 차원의 KPI를 합치는 가중치와 good/bad 임계값은 **실행 중에** 조정할 수 있고, 재채점은
+> 저장된 측정값에 즉시 반영됩니다. 외부 제어기를 작성하기 위한 입출력 규격서는
+> `docs/controller_api.md`입니다.
+
 
 ---
 
@@ -222,37 +320,50 @@ see**, so an occluded vehicle is not scored as a tracker failure.
 
 ## Current status
 
-`avsim suite` on this code, one clean run:
+`avsim suite` on this code, one clean run (a *clean* run matters: the MPC keeps
+a wall-clock budget here, so results shift with machine load — see below):
 
 | scenario | verdict | note |
 |---|---|---|
 | `lane_keeping` | PASS | 0.00 m settled cross-track at 16 m/s |
 | `curved_lane_keeping` | PASS | 0.06 m RMS on a 300 m radius |
-| `static_obstacle` | FAIL | hairline: 2.518 m against a 2.5 m bound on a *lane-change* RMS |
-| `blocked_single_lane` | PASS | stops 4.3 m short with no room to pass |
-| `lead_braking` | FAIL | hairline: 8.008 m/s² against an 8 m/s² bound |
+| `static_obstacle` | PASS | finds the go-around homotopy |
+| `blocked_single_lane` | PASS | stops short with no room to pass |
+| `lead_braking` | PASS | |
 | `cut_in` | PASS | |
 | `low_mu_curve` | FAIL | hairline: 5.084 m/s² against a 5 m/s² bound |
-| `signal_green` / `signal_red` / `signal_yellow_dilemma` | PASS | including the dilemma-zone decision |
-| `tight_right_turn` | FAIL | **open**: see below |
-| `unprotected_left` | PASS | the lecture's running example, completed |
-| `cross_traffic` | PASS | yields to a red-light runner |
+| `signal_green` / `signal_red` / `signal_yellow_dilemma` | PASS | stops **at** the line, including the dilemma-zone decision |
+| `tight_right_turn` | FAIL | jerk 5.95 against 5.5 on a 5.75 m radius |
+| `unprotected_left` | FAIL | completes; 0.62 m cross-track RMS against 0.5 |
+| `cross_traffic` | FAIL | completes; 0.59 m cross-track RMS against 0.35 |
 
-Two things this table is honestly saying.
+Three things this table is honestly saying.
 
-**`tight_right_turn` is an open defect.** It passes when run alone and fails
-inside the suite. The cause is the MPC's wall-clock budget: under load the
-solver gets fewer iterations, the lattice then rejects more candidates on the
-5.75 m radius, and the fallback takes over (91% of ticks). The budget is kept
-because without it the solve tail reaches 400 ms and the loop is not real time;
-the trade is documented at `MPCConfig.time_budget` and `time_budget=None` makes
-runs reproducible at that cost. The right fix is a cheaper standstill and
-low-speed regime, not a longer budget.
+**The signal scenarios now stop where they were asked to.** They passed before
+by accident: a stop decision capped the whole velocity profile at zero, so the
+vehicle braked immediately and came to rest 55 m short of the line. That is a
+pass on red-light compliance and a failure at driving, and it made the grid
+routes of the test platform — where the car must actually reach the
+intersection — impossible. Fixing it (decisions 23–24) exposed two further
+defects that the early stop had been hiding: near standstill the lattice could
+not plan a lateral correction at all, and the "holding a stop" test skipped the
+solve on every departure (decisions 25–26).
 
-**Three hairline failures are left failing on purpose.** 2.518 against 2.5 and
-8.008 against 8 could be made green by moving the bound. They are the KPI layer
+**`unprotected_left` and `cross_traffic` are the cost of that fix, and they are
+tracking failures rather than behaviour failures.** Both complete the manoeuvre
+and neither collides. The RMS comes from a ~1 m lateral excursion during the
+emergency stop the oncoming vehicle provokes, recovered over the following 10 m.
+Before the change, both passed while stopping short of the intersection they
+were supposed to enter.
+
+**Two hairline failures are left failing on purpose.** 5.084 against 5.0 and
+5.95 against 5.5 could be made green by moving the bound. They are the KPI layer
 doing its job, and moving a threshold to cover a number it was written to catch
 is how a test suite stops meaning anything.
+
+The platform's own presets (`avsim platform --headless`) run the same stack
+without the wall-clock budget, which makes them bit-reproducible: two runs of
+`free_drive` agree exactly on time-to-goal, red-light violations and distance.
 
 ---
 
@@ -271,14 +382,20 @@ Stated rather than discovered:
 * **Tires** use a load-scaled Magic Formula with no relaxation length in the
   force path, no camber, no temperature and no combined-slip longitudinal
   saturation beyond the friction ellipse.
-* **The solver** is single shooting with a wall-clock budget. When the budget
-  binds the returned solution is suboptimal and possibly constraint-violating;
-  the stack falls back to the geometric controller and **records that it did**.
+* **The solver** is single shooting with a wall-clock budget in the scenario
+  suite. When the budget binds the returned solution is suboptimal and possibly
+  constraint-violating; the stack falls back to the geometric controller and
+  **records that it did**. The test platform runs without the budget, on
+  iteration bounds alone, because a comparison cannot survive results that
+  depend on machine load (design decision 18).
 * **Inter-sample feasibility** is tightened, not guaranteed (above).
-* **Runs are not bit-reproducible** while the MPC has a wall-clock budget,
-  because the number of iterations depends on machine load. Set
-  `MPCConfig.time_budget = None` for reproducibility and accept a longer
-  solve-time tail.
+* **Suite runs are not bit-reproducible** while the MPC has a wall-clock budget,
+  because the number of iterations depends on machine load. Platform runs are:
+  they carry no budget.
+* **Tracking degrades during an emergency stop.** The vehicle drifts about a
+  metre laterally while braking hard in an intersection and recovers over the
+  next 10 m. It completes the manoeuvre and does not collide, but it is why
+  `unprotected_left` and `cross_traffic` miss their cross-track bounds.
 * **The low-speed regime is the weak one**, exactly where the lecture says it
   will be. At rest the prediction model loses steering authority, the augmented
   Lagrangian fights the `v >= 0` bound, and the stack has to hold the steering

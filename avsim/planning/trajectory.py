@@ -237,47 +237,57 @@ class FrenetLatticePlanner:
         """
         cfg = self.cfg
         out: list[Trajectory] = []
+        # Werling's low-speed branch.  Below this the lateral polynomial is
+        # taken over *distance* rather than time; see ``_lateral`` for why.
+        low_speed = v0 < self.LOW_SPEED_LATERAL
         for T in (horizons if horizons is not None else cfg.horizons):
             t = np.arange(0.0, T + 1e-9, cfg.dt)
-            for off in cfg.lateral_offsets:
-                e_target = target_offset + off
-                cl = quintic(e_y0, de_y0, dde_y0, e_target, 0.0, 0.0, T)
-                e_y = _poly(cl, t)
-                de_y = _poly(cl, t, 1)
-                jerk_lat = float(np.mean(_poly(cl, t, 3) ** 2))
+            lon_specs = []
+            if stop_s is not None:
+                s_end = max(stop_s, s0)
+                lon_specs.append(("stop", quintic(s0, v0, a0, s_end, 0.0, 0.0, T)))
+            # Clamp each sampled target speed to what is reachable in T at
+            # the acceleration limits.  Without this, a vehicle pulling away
+            # from a stop samples only targets it cannot reach, every
+            # candidate is rejected as over-accelerating, and the planner
+            # reports "no plan" on an empty road.
+            # A minimum-jerk speed change peaks at 1.5x its average:
+            # v(tau) = v0 + dv (3 tau^2 - 2 tau^3) has |v'|_max = 1.5 dv / T.
+            # Clamping to the average alone still samples targets whose peak
+            # acceleration violates the limit, so every candidate is
+            # rejected -- which is what makes a stopped vehicle unable to
+            # find any plan and never pull away.
+            peak = 1.5
+            # On a curve the Frenet speed is ``ds (1 - kappa e_y)``, so holding
+            # an offset on the outside of a bend costs longitudinal budget the
+            # sampler would otherwise spend: at R = 12.75 m and e_y = -1.75 m
+            # that is 14%, enough to reject every pull-away candidate for
+            # exceeding ``a_lon_max`` while the vehicle sits still.
+            e_max = max(abs(corridor[0]), abs(corridor[1])) if corridor else 1.75
+            reach = min(s0 + max(v0 * T, 5.0), path.length)
+            _, _, _, kap_ahead = path.frames(np.linspace(s0, reach, 8))
+            den_max = 1.0 + float(np.max(np.abs(kap_ahead))) * (abs(target_offset) + e_max)
+            v_hi = v0 + cfg.a_lon_max * T / (peak * den_max)
+            v_lo = max(v0 + cfg.a_lon_min * T / peak, 0.0)
+            if a0 < 0.0:  # already braking: that speed is reachable too
+                v_lo = max(v0 + (cfg.a_lon_min + a0) * T / (2 * peak), 0.0)
+            for dv in cfg.speed_samples:
+                v_t = float(np.clip(target_speed + dv, v_lo, v_hi))
+                lon_specs.append(("keep", quartic(s0, v0, a0, max(v_t, 0.0), 0.0, T)))
 
-                lon_specs = []
-                if stop_s is not None:
-                    s_end = max(stop_s, s0)
-                    lon_specs.append(("stop", quintic(s0, v0, a0, s_end, 0.0, 0.0, T)))
-                # Clamp each sampled target speed to what is reachable in T at
-                # the acceleration limits.  Without this, a vehicle pulling away
-                # from a stop samples only targets it cannot reach, every
-                # candidate is rejected as over-accelerating, and the planner
-                # reports "no plan" on an empty road.
-                # A minimum-jerk speed change peaks at 1.5x its average:
-                # v(tau) = v0 + dv (3 tau^2 - 2 tau^3) has |v'|_max = 1.5 dv / T.
-                # Clamping to the average alone still samples targets whose peak
-                # acceleration violates the limit, so every candidate is
-                # rejected -- which is what makes a stopped vehicle unable to
-                # find any plan and never pull away.
-                peak = 1.5
-                v_hi = v0 + cfg.a_lon_max * T / peak
-                v_lo = max(v0 + cfg.a_lon_min * T / peak, 0.0)
-                if a0 < 0.0:  # already braking: that speed is reachable too
-                    v_lo = max(v0 + (cfg.a_lon_min + a0) * T / (2 * peak), 0.0)
-                for dv in cfg.speed_samples:
-                    v_t = float(np.clip(target_speed + dv, v_lo, v_hi))
-                    lon_specs.append(("keep", quartic(s0, v0, a0, max(v_t, 0.0), 0.0, T)))
+            for kind, cs in lon_specs:
+                s = _poly(cs, t)
+                ds = _poly(cs, t, 1)
+                jerk_lon = float(np.mean(_poly(cs, t, 3) ** 2))
+                if np.any(ds < -0.5):
+                    continue  # no reversing in these manoeuvres
+                ds = np.maximum(ds, 0.0)
 
-                for kind, cs in lon_specs:
-                    s = _poly(cs, t)
-                    ds = _poly(cs, t, 1)
-                    dds = _poly(cs, t, 2)
-                    jerk_lon = float(np.mean(_poly(cs, t, 3) ** 2))
-                    if np.any(ds < -0.5):
-                        continue  # no reversing in these manoeuvres
-                    ds = np.maximum(ds, 0.0)
+                for off in cfg.lateral_offsets:
+                    e_target = target_offset + off
+                    e_y, de_y, jerk_lat = self._lateral(
+                        e_y0, de_y0, dde_y0, e_target, t, T, s - s0, ds, v0, low_speed
+                    )
 
                     x, y, psi, v = self._to_cartesian(path, s, e_y, de_y, ds)
                     kappa = self._path_curvature(x, y, psi, v, t)
@@ -291,7 +301,19 @@ class FrenetLatticePlanner:
                         "jerk_lat": cfg.w_jerk_lat * jerk_lat,
                         "jerk_lon": cfg.w_jerk_lon * jerk_lon,
                         "offset": cfg.w_offset * (e_target - target_offset) ** 2,
-                        "speed": cfg.w_speed * float(np.mean((v - target_speed) ** 2)),
+                        # A stop candidate is not judged against the cruise
+                        # target: it ends at zero *by construction*, so scoring
+                        # its speed against 8 m/s charges it 150 points for
+                        # doing what it was asked.  With that penalty the
+                        # planner picks a candidate that merely slows, arrives
+                        # at the line still moving, and runs it -- the stop
+                        # exists in the candidate set and never wins.  The
+                        # commanded stop point is the intent; the speed target
+                        # is the intent only when there is no stop.
+                        "speed": (
+                            0.0 if kind == "stop"
+                            else cfg.w_speed * float(np.mean((v - target_speed) ** 2))
+                        ),
                         "time": cfg.w_time * T,
                         "consistency": (
                             0.0 if self.previous_offset is None
@@ -302,6 +324,78 @@ class FrenetLatticePlanner:
                     traj.feasible = traj.reject_reason == ""
                     out.append(traj)
         return out
+
+    #: Below this initial speed the lateral polynomial is taken over distance
+    #: rather than over time -- Werling's low-speed formulation [m/s].
+    LOW_SPEED_LATERAL = 3.0
+    #: Distance over which the low-speed branch completes a lateral correction [m].
+    LATERAL_RETURN_DISTANCE = 12.0
+
+    def _lateral(
+        self,
+        e_y0: float,
+        de_y0: float,
+        dde_y0: float,
+        e_target: float,
+        t: np.ndarray,
+        T: float,
+        travel: np.ndarray,
+        ds: np.ndarray,
+        v0: float,
+        low_speed: bool,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """Lateral offset along a candidate, in time or in distance.
+
+        At speed, ``e_y(t)`` as a minimum-jerk polynomial in **time** is the
+        right thing: the vehicle covers metres while it moves metres sideways,
+        and the resulting path curvature is small.
+
+        Near standstill it is not, and the failure is total rather than
+        cosmetic.  A polynomial in time puts a 1.5 m correction into the first
+        second whatever the vehicle is doing; from rest that first second covers
+        about a metre of road, so the implied path curvature is enormous and
+        *every* candidate is rejected -- for curvature, for lateral
+        acceleration, or for leaving the corridor.  Measured at ``e_y = -1.5``
+        and ``v = 0``: 0 of 81 candidates feasible.  The vehicle is trapped: it
+        cannot pull away, so it never gains the speed that would make pulling
+        away plannable.
+
+        So below :attr:`LOW_SPEED_LATERAL` the polynomial is taken over the
+        distance the candidate actually travels -- Werling's low-speed
+        formulation.  The correction is then spread over metres of road rather
+        than over seconds of clock, and it is feasible by construction: a 1.5 m
+        offset returned over 20 m of travel is a 0.02 1/m curve.
+
+        Returns ``(e_y, de_y/dt, mean squared lateral jerk)``.  The jerk is per
+        second cubed in the time branch and per metre cubed in the distance one;
+        the two are never mixed inside one call, and the cost only ever compares
+        candidates from the same call.
+        """
+        if not low_speed:
+            cl = quintic(e_y0, de_y0, dde_y0, e_target, 0.0, 0.0, T)
+            return _poly(cl, t), _poly(cl, t, 1), float(np.mean(_poly(cl, t, 3) ** 2))
+
+        if float(travel[-1]) < 0.5:
+            # The candidate barely moves: hold the offset rather than pretend a
+            # lateral manoeuvre can happen in half a metre.
+            e_y = np.full_like(t, float(e_y0))
+            return e_y, np.zeros_like(t), 0.0
+
+        # The correction is spread over a bounded distance rather than over the
+        # candidate's whole travel.  Pulling away from rest covers 30 m in a
+        # 4.5 s horizon, and returning to the centreline over all of it leaves
+        # the vehicle wide for most of the manoeuvre -- feasible, and it costs
+        # the completion of an unprotected left.  12 m is the shortest distance
+        # in which the full corridor width can be recovered inside the curvature
+        # limit: 1.75 m over 12 m is 0.07 1/m against a limit of 0.25.
+        S = float(np.clip(travel[-1], 4.0, self.LATERAL_RETURN_DISTANCE))
+        # Chain rule at the initial point: de_y/ds = (de_y/dt) / v.
+        de_ds0 = de_y0 / max(v0, 1e-3) if v0 > 1e-3 else 0.0
+        cl = quintic(e_y0, de_ds0, 0.0, e_target, 0.0, 0.0, S)
+        u = np.clip(travel, 0.0, S)
+        e_y = _poly(cl, u)
+        de_y = _poly(cl, u, 1) * ds          # back to d/dt for the Cartesian map
+        return e_y, de_y, float(np.mean(_poly(cl, u, 3) ** 2))
 
     @staticmethod
     def _path_curvature(x, y, psi, v, t) -> np.ndarray:

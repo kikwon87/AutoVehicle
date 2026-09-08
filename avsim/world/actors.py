@@ -142,6 +142,13 @@ class TrafficActor:
     signal_group: str | None = None
     #: arc length of the stop line along ``path``
     stop_line_s: float | None = None
+    #: Every signalized stop line along the route, ``(arc length, group)``.
+    #: A route across a grid crosses several; an actor that can hold only one
+    #: obeys the first light and runs every one after it.
+    route_signals: list[tuple[float, str]] = field(default_factory=list)
+    #: lane ids the route is made of, and the arc length each begins at
+    lane_sequence: list[str] = field(default_factory=list)
+    lane_starts: list[float] = field(default_factory=list)
     wheelbase: float = 2.7
     lane_id: str | None = None
     kind: str = "vehicle"
@@ -159,6 +166,9 @@ class TrafficActor:
     done: bool = False
 
     def __post_init__(self) -> None:
+        if not self.route_signals and self.stop_line_s is not None and self.signal_group:
+            self.route_signals = [(float(self.stop_line_s), str(self.signal_group))]
+        self.route_signals = sorted(self.route_signals)
         if self._x is None:
             p = self.path.position(self.s)
             self._x, self._y, self._psi = float(p[0]), float(p[1]), self.path.heading(self.s)
@@ -185,6 +195,20 @@ class TrafficActor:
             centre_offset=0.5 * self.length - 0.9,
         )
 
+    def next_signal(self) -> tuple[float | None, str | None]:
+        """The next stop line at or ahead of the actor, or ``(None, None)``."""
+        for stop_s, group in self.route_signals:
+            if stop_s > self.s - 1.0:
+                return stop_s, group
+        return None, None
+
+    def current_lane(self) -> str | None:
+        """Lane id the actor is on, from its arc length along the route."""
+        if not self.lane_sequence:
+            return self.lane_id
+        i = int(np.searchsorted(self.lane_starts, self.s, side="right") - 1)
+        return self.lane_sequence[min(max(i, 0), len(self.lane_sequence) - 1)]
+
     def _virtual_leader_gap(
         self, t: float, lights: TrafficLightController | None
     ) -> tuple[float | None, float]:
@@ -194,14 +218,15 @@ class TrafficActor:
         That reuses the car-following law instead of adding a second
         deceleration rule, so a queue behind a red light forms for free.
         """
-        if lights is None or self.signal_group is None or self.stop_line_s is None:
+        stop_line_s, group = self.next_signal()
+        if lights is None or group is None or stop_line_s is None:
             return None, 0.0
-        if self.s > self.stop_line_s:  # already committed into the box
+        if self.s > stop_line_s:  # already committed into the box
             return None, 0.0
-        colour = lights.state(self.signal_group, t)
+        colour = lights.state(group, t)
         if colour is SignalState.GREEN:
             return None, 0.0
-        gap = self.stop_line_s - self.s - 0.5 * self.length
+        gap = stop_line_s - self.s - 0.5 * self.length
         if colour is SignalState.YELLOW and gap < 0.5 * self.v**2 / self.idm.b:
             return None, 0.0  # cannot stop comfortably; clear the box
         return max(gap, 0.05), self.v

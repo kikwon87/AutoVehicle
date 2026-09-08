@@ -89,7 +89,16 @@ class BehaviorConfig:
     #: reach within its horizon is silently clamped, and the gap closes anyway.
     lead_max_decel: float = 6.0
     conflict_horizon: float = 6.0      #: how far ahead conflicts are checked [s]
-    stop_offset: float = 2.0           #: stop this far before the line [m]
+    #: Clearance the **front bumper** keeps from the stop line [m].
+    #:
+    #: ``stop_s`` is where the *nose* must not pass, because that is what a stop
+    #: line means and what the MPC's half-space constrains.  The arc length the
+    #: planner works in is measured at the rear axle, so the velocity profile and
+    #: the lattice are given ``stop_s - (length - rear_overhang)`` instead --
+    #: 3.7 m further back on the reference car.  Handing the same number to both
+    #: is a bug in one direction or the other: the nose ends up 1.7 m past the
+    #: line, or the car stops 3.7 m short of where it was asked to.
+    stop_offset: float = 2.0
     #: Once an overtake is chosen, hold it for at least this long.  A manoeuvre
     #: re-decided every tick is never executed: the offset target flickers, the
     #: lattice re-plans from a different homotopy each time, and the vehicle

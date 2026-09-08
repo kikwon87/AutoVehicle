@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>avsim — Autonomous Driving Test Platform</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <h1>avsim <span class="thin">자율주행 테스트 플랫폼</span></h1>
+  <div class="head-right">
+    <span id="contract" class="tag">contract –</span>
+    <button id="btn-report" class="ghost">제어기 규격서 / API report</button>
+  </div>
+</header>
+
+<main>
+
+  <!-- ================= left: setup ================= -->
+  <aside id="setup">
+
+    <details open>
+      <summary>1 · 시나리오 <span class="en">Scenario</span></summary>
+      <div class="body">
+        <label class="field">
+          <span>프리셋 Preset</span>
+          <select id="preset"></select>
+        </label>
+        <p id="preset-desc" class="hint"></p>
+        <div class="row">
+          <label class="field small">
+            <span>차량 대수 n</span>
+            <input id="n_vehicles" type="number" min="0" max="80" step="1">
+          </label>
+          <label class="field small">
+            <span>시드 Seed</span>
+            <input id="seed" type="number" min="0" step="1" value="0">
+          </label>
+          <label class="field small">
+            <span>시간 [s]</span>
+            <input id="duration" type="number" min="5" step="5">
+          </label>
+        </div>
+        <input id="n_vehicles_slider" type="range" min="0" max="60" step="1">
+      </div>
+    </details>
+
+    <details open>
+      <summary>2 · 제어 알고리즘 <span class="en">Controller</span></summary>
+      <div class="body">
+        <label class="field">
+          <span>알고리즘 선택</span>
+          <select id="controller"></select>
+        </label>
+        <p id="controller-desc" class="hint"></p>
+        <label class="field">
+          <span>외부 제어기 파일 (.py)</span>
+          <div class="row tight">
+            <input id="plugin-path" type="text" placeholder="examples/controllers/template_stanley.py">
+            <button id="btn-plugin">불러오기</button>
+          </div>
+        </label>
+        <label class="field">
+          <span>옵션 (JSON, <code>create_controller(**options)</code>)</span>
+          <input id="controller-options" type="text" placeholder='{"target_speed": 12}'>
+        </label>
+        <p id="plugin-msg" class="msg"></p>
+      </div>
+    </details>
+
+    <details>
+      <summary>3 · 차량 동역학 파라미터 <span class="en">Vehicle parameters</span></summary>
+      <div class="body">
+        <div class="row tight">
+          <button id="btn-defaults" class="ghost">기본값으로 되돌리기</button>
+        </div>
+        <div id="params"></div>
+        <div id="derived" class="derived"></div>
+      </div>
+    </details>
+
+    <div class="run-bar">
+      <button id="btn-run" class="primary">▶ 실행 Run</button>
+      <button id="btn-stop" class="ghost" disabled>■ 정지</button>
+      <button id="btn-batch" class="ghost">배치 Batch…</button>
+    </div>
+    <p id="run-msg" class="msg"></p>
+  </aside>
+
+  <!-- ================= centre: simulation ================= -->
+  <section id="stage">
+    <div class="canvas-wrap">
+      <canvas id="view" width="900" height="640"></canvas>
+      <div id="overlay" class="overlay"></div>
+    </div>
+
+    <div class="readouts" id="readouts"></div>
+
+    <div class="pedals">
+      <div class="pedal"><label>steer</label><div class="bar center"><i id="bar-steer"></i></div><span id="val-steer">0.00</span></div>
+      <div class="pedal"><label>throttle</label><div class="bar"><i id="bar-throttle" class="green"></i></div><span id="val-throttle">0.00</span></div>
+      <div class="pedal"><label>brake</label><div class="bar"><i id="bar-brake" class="red"></i></div><span id="val-brake">0.00</span></div>
+    </div>
+
+    <details id="diag-box">
+      <summary>제어기 진단 <span class="en">controller diagnostics</span></summary>
+      <div class="body"><table id="diag"></table></div>
+    </details>
+  </section>
+
+  <!-- ================= right: evaluation ================= -->
+  <aside id="eval">
+
+    <div class="score-head">
+      <div class="total"><span id="score-total">–</span><small>종합 점수</small></div>
+      <div id="score-cats" class="cats"></div>
+    </div>
+    <p id="score-notes" class="msg"></p>
+
+    <details open>
+      <summary>KPI 가중치 · 임계값 <span class="en">weights &amp; thresholds</span></summary>
+      <div class="body">
+        <div class="row tight">
+          <label class="field small"><span>충돌 정책</span>
+            <select id="collision-policy">
+              <option value="zero">zero — 충돌 시 0점</option>
+              <option value="penalty">penalty — 감점</option>
+            </select>
+          </label>
+          <label class="field small"><span>감점</span><input id="collision-penalty" type="number" step="5"></label>
+          <label class="field small"><span>TTC 임계 [s]</span><input id="ttc-threshold" type="number" step="0.1"></label>
+        </div>
+        <div id="cat-weights" class="cat-weights"></div>
+        <table id="kpi" class="kpi"></table>
+        <div class="row tight">
+          <button id="btn-rescore" class="primary">가중치 적용 · 재채점</button>
+          <button id="btn-score-reset" class="ghost">초기화</button>
+        </div>
+        <p class="hint">가중치와 good/bad 임계값은 <b>보고 기준</b>이므로, 재채점은 저장된 측정값에 즉시 적용됩니다 — 재시뮬레이션하지 않습니다.</p>
+      </div>
+    </details>
+
+    <details open>
+      <summary>결과 · 순위 <span class="en">results</span></summary>
+      <div class="body">
+        <table id="results" class="results"></table>
+        <div class="row tight">
+          <button id="btn-export" class="ghost">JSON 내보내기</button>
+          <button id="btn-clear" class="ghost">지우기</button>
+        </div>
+      </div>
+    </details>
+  </aside>
+</main>
+
+<!-- ================= modals ================= -->
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <strong id="modal-title">제어기 규격서</strong>
+      <button id="modal-close" class="ghost">닫기</button>
+    </div>
+    <div id="modal-body" class="modal-body"></div>
+  </div>
+</div>
+
+<div id="batch-modal" class="modal hidden">
+  <div class="modal-card narrow">
+    <div class="modal-head"><strong>배치 실행 Batch</strong><button id="batch-close" class="ghost">닫기</button></div>
+    <div class="modal-body">
+      <p class="hint">선택한 프리셋 × 제어기 × 시드의 모든 조합을 끝까지 실행하고 결과 표에 추가합니다. 화면 갱신 없이 계산만 하므로 시간이 걸립니다.</p>
+      <div class="row">
+        <div class="field"><span>프리셋</span><div id="batch-presets" class="checks"></div></div>
+        <div class="field"><span>제어기</span><div id="batch-controllers" class="checks"></div></div>
+      </div>
+      <label class="field"><span>시드 (쉼표 구분)</span><input id="batch-seeds" type="text" value="0,1,2"></label>
+      <div class="row tight">
+        <button id="batch-run" class="primary">배치 실행</button>
+        <span id="batch-msg" class="msg"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

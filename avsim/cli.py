@@ -7,6 +7,8 @@
     avsim suite --out results/      run everything, write reports and figures
     avsim study 3                   run one of the lecture's study tasks
     avsim contract                  print the model contract
+    avsim platform                  start the browser test platform
+    avsim platform --headless --preset unprotected_left --controller mpc
 """
 
 from __future__ import annotations
@@ -104,6 +106,48 @@ def _cmd_contract(args) -> int:
     return 0
 
 
+def _cmd_platform(args) -> int:
+    """Start the test platform, or run one of its presets without a browser.
+
+    ``--headless`` exists so a controller can be scored from a script or a CI
+    job: the platform's value is the comparison, and a comparison that only
+    happens in a browser cannot be automated.
+    """
+    if not args.headless:
+        from .platform.server import serve
+
+        serve(host=args.host, port=args.port, open_browser=not args.no_browser)
+        return 0
+
+    from .platform.session import RunConfig, RunSession
+
+    config = RunConfig(
+        preset=args.preset,
+        controller=args.controller,
+        seed=args.seed,
+        n_vehicles=args.n_vehicles,
+        duration=args.duration,
+    )
+    result = RunSession(config).run()
+    print(f"{result.preset} / {result.controller}: {result.finish_reason} "
+          f"after {result.duration:.1f} s")
+    for key, value in sorted(result.metrics.items()):
+        if isinstance(value, float):
+            print(f"  {key:24s} {value:10.3f}")
+        else:
+            print(f"  {key:24s} {value!s:>10}")
+    print(f"  {'SCORE':24s} {result.score.total:10.1f}")
+    for cat, value in result.score.categories.items():
+        print(f"    {cat:22s} {value:10.1f}")
+    for note in result.score.notes:
+        print(f"  note: {note}")
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as fh:
+            json.dump(result.to_dict(include_log=args.log), fh, indent=2, default=str)
+        print(f"wrote {args.json}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="avsim", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -130,6 +174,24 @@ def main(argv: list[str] | None = None) -> int:
     p_study.set_defaults(func=_cmd_study)
 
     sub.add_parser("contract", help="print the model contract").set_defaults(func=_cmd_contract)
+
+    p_platform = sub.add_parser("platform", help="the browser test platform")
+    p_platform.add_argument("--host", default="127.0.0.1")
+    p_platform.add_argument("--port", type=int, default=8770)
+    p_platform.add_argument("--no-browser", action="store_true",
+                            help="do not open a browser window")
+    p_platform.add_argument("--headless", action="store_true",
+                            help="run one preset and print its KPIs instead of serving")
+    p_platform.add_argument("--preset", default="grid_random")
+    p_platform.add_argument("--controller", default="mpc",
+                            help="a builtin key, or the path to a .py plug-in")
+    p_platform.add_argument("--seed", type=int, default=0)
+    p_platform.add_argument("--n-vehicles", type=int, default=None, dest="n_vehicles")
+    p_platform.add_argument("--duration", type=float, default=None)
+    p_platform.add_argument("--json", help="write the result as JSON")
+    p_platform.add_argument("--log", action="store_true",
+                            help="include the per-tick log in --json")
+    p_platform.set_defaults(func=_cmd_platform)
 
     args = parser.parse_args(argv)
     return args.func(args)
