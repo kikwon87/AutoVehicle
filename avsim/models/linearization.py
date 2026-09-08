@@ -241,3 +241,63 @@ def trust_region_radius(
         else:
             hi = mid
     return lo
+
+
+def rk4_jacobians(
+    A_c: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    B_c: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    f: Field,
+    x: np.ndarray,
+    u: np.ndarray,
+    h: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Exact Jacobians of one classical RK4 step, from the continuous Jacobians.
+
+    This is **discretize-then-linearize** done analytically: the chain rule is
+    propagated through the four stages, so the result is the derivative of the
+    map the solver actually evaluates rather than an approximation of it.
+
+    With ``k1 = f(x, u)``, ``k2 = f(x + h/2 k1, u)``, ``k3 = f(x + h/2 k2, u)``,
+    ``k4 = f(x + h k3, u)``::
+
+        dk1/dx = A(x)
+        dk2/dx = A(x + h/2 k1) (I + h/2 dk1/dx)
+        dk3/dx = A(x + h/2 k2) (I + h/2 dk2/dx)
+        dk4/dx = A(x + h   k3) (I + h   dk3/dx)
+        dF/dx  = I + h/6 (dk1/dx + 2 dk2/dx + 2 dk3/dx + dk4/dx)
+
+    and the same recursion for ``u``, where each stage also contributes its own
+    ``B``.  Costs four evaluations of ``(A, B)`` instead of the
+    ``2(nx + nu)`` dynamics evaluations a finite difference would need.
+    """
+    x = np.asarray(x, dtype=float)
+    u = np.asarray(u, dtype=float)
+    nx, nu = x.size, u.size
+    I = np.eye(nx)
+
+    k1 = np.asarray(f(x, u), dtype=float)
+    x2 = x + 0.5 * h * k1
+    k2 = np.asarray(f(x2, u), dtype=float)
+    x3 = x + 0.5 * h * k2
+    k3 = np.asarray(f(x3, u), dtype=float)
+    x4 = x + h * k3
+    k4 = np.asarray(f(x4, u), dtype=float)
+
+    A1, B1 = A_c(x, u), B_c(x, u)
+    A2, B2 = A_c(x2, u), B_c(x2, u)
+    A3, B3 = A_c(x3, u), B_c(x3, u)
+    A4, B4 = A_c(x4, u), B_c(x4, u)
+
+    dk1x = A1
+    dk2x = A2 @ (I + 0.5 * h * dk1x)
+    dk3x = A3 @ (I + 0.5 * h * dk2x)
+    dk4x = A4 @ (I + h * dk3x)
+
+    dk1u = B1
+    dk2u = A2 @ (0.5 * h * dk1u) + B2
+    dk3u = A3 @ (0.5 * h * dk2u) + B3
+    dk4u = A4 @ (h * dk3u) + B4
+
+    A_d = I + h / 6.0 * (dk1x + 2 * dk2x + 2 * dk3x + dk4x)
+    B_d = h / 6.0 * (dk1u + 2 * dk2u + 2 * dk3u + dk4u)
+    return A_d, B_d

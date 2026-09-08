@@ -133,3 +133,52 @@ def time_to_collision(
     t1, t2 = (-b - root) / (2 * a), (-b + root) / (2 * a)
     ts = [t for t in (t1, t2) if t >= 0.0]
     return float(min(ts)) if ts else float("inf")
+
+
+def multi_circle_cover(length: float, width: float, n: int = 3) -> tuple[np.ndarray, float]:
+    """Cover a rectangle with ``n`` equal circles along its axis.
+
+    Returns ``(offsets, radius)`` where ``offsets`` are the circle centres along
+    the body x-axis, measured from the rectangle centre.
+
+    A single enclosing circle has radius ``hypot(L, W) / 2`` -- 2.48 m for a
+    4.6 x 1.85 m car -- which is 2.7 times the car's actual half-width.  Every
+    lateral clearance computed from it is wrong by more than a metre, and a
+    planner using it reports an ordinary lane change as a collision.  Three
+    circles bring the radius down to 1.20 m at a cost of nine distance
+    evaluations instead of one.
+    """
+    if n < 1:
+        raise ValueError("n must be >= 1")
+    seg = length / n
+    radius = 0.5 * float(np.hypot(seg, width))
+    offsets = (np.arange(n) - (n - 1) / 2.0) * seg
+    return offsets, radius
+
+
+def circle_centres(x: float, y: float, psi: float, offsets: np.ndarray, body_offset: float = 0.0) -> np.ndarray:
+    """World positions of body-frame axial offsets, shape ``(n, 2)``."""
+    d = np.array([np.cos(psi), np.sin(psi)])
+    return np.array([x, y])[None, :] + (np.asarray(offsets) + body_offset)[:, None] * d[None, :]
+
+
+def ellipse_clearance(
+    delta: np.ndarray, heading: float, a: float, b: float
+) -> float:
+    """Normalized clearance of a separation vector against an oriented ellipse.
+
+    ``delta`` is the vector from the ellipse centre to the query point and
+    ``heading`` the ellipse's major-axis direction.  Returns
+    ``sqrt((d_lon/a)^2 + (d_lat/b)^2) - 1``: negative inside, zero on the
+    boundary, positive outside.
+
+    The anisotropy is the point.  A vehicle's predicted position is uncertain
+    mostly *along* its direction of travel -- it may brake or accelerate -- and
+    only slightly across it, because it is expected to stay in its lane.  An
+    isotropic radius inherits the longitudinal growth in the lateral direction
+    and forbids passes that are in fact wide open.
+    """
+    c, s = np.cos(heading), np.sin(heading)
+    d_lon = delta[0] * c + delta[1] * s
+    d_lat = -delta[0] * s + delta[1] * c
+    return float(np.hypot(d_lon / max(a, 1e-6), d_lat / max(b, 1e-6)) - 1.0)
