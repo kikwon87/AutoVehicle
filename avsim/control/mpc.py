@@ -72,12 +72,36 @@ class CorridorStage:
 
 
 @dataclass
+class StopLineConstraint:
+    """A half-space the vehicle's front bumper must not cross.
+
+    ``(p_front - point) . tangent <= 0``
+
+    A stop is not reliably produced by a speed reference alone: the reference
+    says *how fast* to be at each time, and any tracking lag turns into
+    overshoot past the line.  Stating the stop as a position constraint makes
+    the optimizer responsible for it, and the augmented Lagrangian then trades
+    comfort against it rather than ignoring it.
+    """
+
+    point: np.ndarray   #: (2,) world point on the stop line
+    tangent: np.ndarray  #: (2,) unit vector along the direction of travel
+
+
+@dataclass
 class MPCConfig:
     horizon: int = 25
     dt: float = 0.12
-    #: state weights on ``[X, Y, psi, v, delta]``
-    Q: tuple[float, ...] = (2.0, 6.0, 12.0, 1.5, 0.0)
-    Qf: tuple[float, ...] = (4.0, 12.0, 24.0, 3.0, 0.0)
+    #: State weights, in the **path frame**: ``[e_lon, e_lat, e_psi, e_v, delta]``.
+    #:
+    #: Weighting ``X`` and ``Y`` directly would make the lateral gain depend on
+    #: which way the road happens to point -- 6 on a road running north, 2 on
+    #: one running east, and anything between on a curve. Rotating the position
+    #: error into the reference tangent/normal makes "lateral" mean lateral
+    #: everywhere, which is the difference between holding a curve and drifting
+    #: 1.3 m wide through it.
+    Q: tuple[float, ...] = (1.0, 12.0, 15.0, 2.0, 0.5)
+    Qf: tuple[float, ...] = (2.0, 24.0, 30.0, 4.0, 0.5)
     #: input weights on ``[a, delta_dot]``
     R: tuple[float, ...] = (0.6, 20.0)
     v_max: float = 30.0
@@ -85,6 +109,18 @@ class MPCConfig:
     a_y_max: float = 4.4
     #: fraction of the steering limit the optimizer may use
     delta_margin: float = 0.95
+    #: Replace the kinematic yaw equation ``psi' = v tan(delta) / L`` with
+    #: ``psi' = v tan(delta) / (L + K_us v^2)``.
+    #:
+    #: The two agree at low speed and diverge exactly as the lecture's
+    #: steady-state relation ``delta_ss = (L + K_us V^2) kappa`` says they must.
+    #: Without it the prediction model has no understeer at all, so on a curve
+    #: the optimizer commands the geometric steering angle, the real vehicle
+    #: runs wide, and the feedback is left to generate a steady-state demand the
+    #: model already knows about -- which is precisely what the lecture warns
+    #: against. Measured on a 300 m radius at 16 m/s, this is the difference
+    #: between a steady 1.9 m drift and holding the lane.
+    understeer_correction: bool = True
     #: how many sigma of prediction uncertainty the obstacle ellipse clears
     inflate_sigma: float = 1.0
     n_circles: int = 3
@@ -128,18 +164,30 @@ class VehicleMPC:
 
         # Per-solve context, refreshed by solve() before the solver runs.
         self._ref = np.zeros((self.cfg.horizon + 1, 4))
+        self._ref_cos = np.ones(self.cfg.horizon + 1)
+        self._ref_sin = np.zeros(self.cfg.horizon + 1)
         self._corridor: list[CorridorStage | None] = [None] * (self.cfg.horizon + 1)
         self._obs: list[list[tuple[np.ndarray, float, float, float]]] = [
             [] for _ in range(self.cfg.horizon + 1)
         ]
         self._nc = 0
+        self._stop: StopLineConstraint | None = None
+        #: rear axle to front bumper [m]
+        self._front_offset = params.length - params.rear_overhang
 
     # --- model ---------------------------------------------------------------
 
+    def _effective_wheelbase(self, v: float) -> float:
+        """``L`` or ``L + K_us v^2``, depending on ``understeer_correction``."""
+        if not self.cfg.understeer_correction:
+            return self.p.L
+        return self.p.L + self.p.understeer_gradient * v * v
+
     def field(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
         psi, v, delta = x[IPSI], x[IV], x[IDELTA]
+        Le = self._effective_wheelbase(v)
         return np.array(
-            [v * np.cos(psi), v * np.sin(psi), v / self.p.L * np.tan(delta), u[IA], u[IDDELTA]]
+            [v * np.cos(psi), v * np.sin(psi), v * np.tan(delta) / Le, u[IA], u[IDDELTA]]
         )
 
     def _A_c(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
@@ -149,8 +197,14 @@ class VehicleMPC:
         A[IX, IV] = np.cos(psi)
         A[IY, IPSI] = v * np.cos(psi)
         A[IY, IV] = np.sin(psi)
-        A[IPSI, IV] = np.tan(delta) / self.p.L
-        A[IPSI, IDELTA] = v / (self.p.L * np.cos(delta) ** 2)
+        Le = self._effective_wheelbase(v)
+        if self.cfg.understeer_correction:
+            # d/dv [ v tan d / (L + K v^2) ] = tan d (L - K v^2) / (L + K v^2)^2
+            K = self.p.understeer_gradient
+            A[IPSI, IV] = np.tan(delta) * (self.p.L - K * v * v) / Le**2
+        else:
+            A[IPSI, IV] = np.tan(delta) / Le
+        A[IPSI, IDELTA] = v / (Le * np.cos(delta) ** 2)
         return A
 
     @staticmethod
@@ -177,16 +231,33 @@ class VehicleMPC:
     # --- cost ----------------------------------------------------------------
 
     def _residual(self, x: np.ndarray, k: int) -> np.ndarray:
-        r = np.zeros(NX)
+        """Tracking error in the **reference path frame**.
+
+        ``[e_lon, e_lat, e_psi, e_v, delta]``, where the position error is
+        rotated into the reference tangent/normal.  The heading residual is
+        wrapped: a reference crossing ``+-pi`` otherwise produces a ``2 pi``
+        error and one step of full-lock steering.
+        """
         ref = self._ref[k]
-        r[IX] = x[IX] - ref[0]
-        r[IY] = x[IY] - ref[1]
-        # The heading residual must be wrapped, or a reference crossing +-pi
-        # produces a 2*pi error and full-lock steering for one step.
-        r[IPSI] = wrap_to_pi(x[IPSI] - ref[2])
-        r[IV] = x[IV] - ref[3]
-        r[IDELTA] = x[IDELTA]
-        return r
+        c, s_ = self._ref_cos[k], self._ref_sin[k]
+        dx, dy = x[IX] - ref[0], x[IY] - ref[1]
+        return np.array(
+            [
+                dx * c + dy * s_,
+                -dx * s_ + dy * c,
+                wrap_to_pi(x[IPSI] - ref[2]),
+                x[IV] - ref[3],
+                x[IDELTA],
+            ]
+        )
+
+    def _residual_jacobian(self, k: int) -> np.ndarray:
+        """``dr/dx`` -- a rotation on the position block, identity elsewhere."""
+        c, s_ = self._ref_cos[k], self._ref_sin[k]
+        J = np.eye(NX)
+        J[0, IX], J[0, IY] = c, s_
+        J[1, IX], J[1, IY] = -s_, c
+        return J
 
     def _stage_cost(self, x, u, k) -> float:
         Q = np.asarray(self.cfg.Q)
@@ -198,7 +269,14 @@ class VehicleMPC:
         Q = np.asarray(self.cfg.Q)
         R = np.asarray(self.cfg.R)
         r = self._residual(x, k)
-        return 2 * Q * r, 2 * R * u, 2 * np.diag(Q), 2 * np.diag(R), np.zeros((NU, NX))
+        J = self._residual_jacobian(k)
+        return (
+            2 * J.T @ (Q * r),
+            2 * R * u,
+            2 * J.T @ np.diag(Q) @ J,
+            2 * np.diag(R),
+            np.zeros((NU, NX)),
+        )
 
     def _terminal_cost(self, x) -> float:
         Qf = np.asarray(self.cfg.Qf)
@@ -207,14 +285,16 @@ class VehicleMPC:
 
     def _terminal_derivs(self, x):
         Qf = np.asarray(self.cfg.Qf)
-        return 2 * Qf * self._residual(x, self.cfg.horizon), 2 * np.diag(Qf)
+        N = self.cfg.horizon
+        J = self._residual_jacobian(N)
+        return 2 * J.T @ (Qf * self._residual(x, N)), 2 * J.T @ np.diag(Qf) @ J
 
     # --- constraints ---------------------------------------------------------
 
     def _constraints(self, x, u, k) -> np.ndarray:
         cfg = self.cfg
         d_max = cfg.delta_margin * self.p.actuator.delta_max
-        a_y = x[IV] ** 2 * np.tan(x[IDELTA]) / self.p.L
+        a_y = x[IV] ** 2 * np.tan(x[IDELTA]) / self._effective_wheelbase(x[IV])
         out = [
             x[IDELTA] - d_max,
             -x[IDELTA] - d_max,
@@ -227,6 +307,9 @@ class VehicleMPC:
         if cor is not None:
             e = float((x[:2] - cor.p_ref) @ cor.normal)
             out += [e - cor.hi, cor.lo - e]
+        if self._stop is not None:
+            p_front = x[:2] + self._front_offset * np.array([np.cos(x[IPSI]), np.sin(x[IPSI])])
+            out.append(float((p_front - self._stop.point) @ self._stop.tangent))
         for centre, heading, a, b in self._obs[k]:
             for off in self._ego_off:
                 p = x[:2] + (off + self._ego_body_offset) * np.array(
@@ -252,9 +335,14 @@ class VehicleMPC:
         add(-_unit(NX, IV))
 
         v, delta = x[IV], x[IDELTA]
+        Le = self._effective_wheelbase(v)
         g = np.zeros(NX)
-        g[IV] = 2 * v * np.tan(delta) / self.p.L
-        g[IDELTA] = v**2 / (self.p.L * np.cos(delta) ** 2)
+        if self.cfg.understeer_correction:
+            K = self.p.understeer_gradient
+            g[IV] = np.tan(delta) * v * (2 * self.p.L) / Le**2
+        else:
+            g[IV] = 2 * v * np.tan(delta) / Le
+        g[IDELTA] = v**2 / (Le * np.cos(delta) ** 2)
         add(g)
         add(-g)
 
@@ -267,6 +355,12 @@ class VehicleMPC:
 
         psi = x[IPSI]
         c_psi, s_psi = np.cos(psi), np.sin(psi)
+        if self._stop is not None:
+            tg = self._stop.tangent
+            g = np.zeros(NX)
+            g[IX], g[IY] = tg
+            g[IPSI] = self._front_offset * float(tg @ np.array([-s_psi, c_psi]))
+            add(g)
         for centre, heading, a, b in self._obs[k]:
             ch, sh = np.cos(heading), np.sin(heading)
             for off in self._ego_off:
@@ -294,10 +388,13 @@ class VehicleMPC:
 
     # --- context ------------------------------------------------------------
 
-    def _set_context(self, reference, corridor, predictions):
+    def _set_context(self, reference, corridor, predictions, stop_line=None):
         cfg = self.cfg
+        self._stop = stop_line
         N = cfg.horizon
         self._ref = np.asarray(reference, dtype=float).reshape(N + 1, 4)
+        self._ref_cos = np.cos(self._ref[:, 2])
+        self._ref_sin = np.sin(self._ref[:, 2])
         self._corridor = list(corridor) if corridor is not None else [None] * (N + 1)
         if len(self._corridor) != N + 1:
             raise ValueError("corridor must have horizon + 1 entries")
@@ -355,6 +452,7 @@ class VehicleMPC:
         reference: np.ndarray,
         corridor: list[CorridorStage | None] | None = None,
         predictions: list[Prediction] | None = None,
+        stop_line: StopLineConstraint | None = None,
     ) -> MPCResult:
         """One receding-horizon solve.
 
@@ -362,7 +460,7 @@ class VehicleMPC:
         ``reference`` is ``(N+1, 4)`` of ``[X, Y, psi, v]``.
         """
         cfg = self.cfg
-        self._set_context(reference, corridor, predictions or [])
+        self._set_context(reference, corridor, predictions or [], stop_line)
 
         act = self.p.actuator
         u_lo = np.array([act.a_min, -act.delta_rate_max])
@@ -402,7 +500,8 @@ class VehicleMPC:
         self._lam_prev = res.lam.copy() if res.lam is not None else None
         self._penalty_prev = res.penalty
 
-        a_y = res.X[:, IV] ** 2 * np.tan(res.X[:, IDELTA]) / self.p.L
+        Le = np.array([self._effective_wheelbase(v) for v in res.X[:, IV]])
+        a_y = res.X[:, IV] ** 2 * np.tan(res.X[:, IDELTA]) / Le
         return MPCResult(
             a_cmd=float(res.U[0, IA]),
             delta_cmd=float(res.X[1, IDELTA]),

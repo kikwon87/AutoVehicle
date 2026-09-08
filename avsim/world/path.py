@@ -71,6 +71,42 @@ class ReferencePath:
         """Frenet ``(s, e_y)`` to world ``(x, y)``."""
         return self.position(s) + e_y * self.normal(s)
 
+    def table(self, ds: float = 0.25) -> dict:
+        """Cached tabulation of the path for **vectorized** queries.
+
+        Returns ``{"s", "x", "y", "theta", "kappa"}`` on a uniform grid, with
+        ``theta`` unwrapped so linear interpolation across ``+-pi`` is correct.
+
+        Scalar ``position``/``heading``/``curvature`` calls are exact but cost a
+        Python call each; a trajectory lattice makes tens of thousands of them
+        per plan, which dominates the planning time by an order of magnitude
+        over the optimizer it feeds.  Interpolating a 0.25 m table is accurate
+        to well under a centimetre on these geometries and turns that loop into
+        three :func:`numpy.interp` calls.
+        """
+        cached = getattr(self, "_table_cache", None)
+        if cached is not None and abs(cached["ds"] - ds) < 1e-12:
+            return cached
+        n = max(int(self.length / ds) + 1, 4)
+        ss = np.linspace(0.0, self.length, n)
+        xy = np.array([self.position(v) for v in ss])
+        th = np.unwrap(np.array([self.heading(v) for v in ss]))
+        ka = np.array([self.curvature(v) for v in ss])
+        cached = {"ds": ds, "s": ss, "x": xy[:, 0], "y": xy[:, 1], "theta": th, "kappa": ka}
+        self._table_cache = cached
+        return cached
+
+    def frames(self, s: np.ndarray, ds: float = 0.25):
+        """Vectorized ``(x, y, theta, kappa)`` at many arc lengths."""
+        tab = self.table(ds)
+        sc = np.clip(np.asarray(s, dtype=float), 0.0, self.length)
+        return (
+            np.interp(sc, tab["s"], tab["x"]),
+            np.interp(sc, tab["s"], tab["y"]),
+            wrap_to_pi(np.interp(sc, tab["s"], tab["theta"])),
+            np.interp(sc, tab["s"], tab["kappa"]),
+        )
+
     def sample(self, ds: float = 0.5) -> np.ndarray:
         """Uniformly sampled polyline ``(N, 2)`` for rendering and collision tests."""
         n = max(int(self.length / ds) + 1, 2)

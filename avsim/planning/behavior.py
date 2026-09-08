@@ -31,9 +31,11 @@ from typing import Sequence
 
 import numpy as np
 
+from ..core.geometry import circle_centres, ellipse_clearance, multi_circle_cover
 from ..models.params import VehicleParams
 from ..world.path import ReferencePath
 from ..world.traffic_light import DilemmaZone, SignalState, TrafficLightController
+from ..world.actors import IDMParams, idm_acceleration
 from .prediction import Prediction
 from .velocity_profile import stopping_distance
 
@@ -45,6 +47,7 @@ class BehaviorState(Enum):
     YIELD = "yield"
     CLEAR_INTERSECTION = "clear_intersection"
     EMERGENCY_STOP = "emergency_stop"
+    OVERTAKE = "overtake"
 
 
 @dataclass
@@ -53,7 +56,17 @@ class BehaviorDecision:
 
     state: BehaviorState
     target_speed: float
-    stop_s: float | None = None          #: arc length to stop at, if any
+    #: **Absolute** arc length along the route to stop at, or ``None``.
+    #: Always absolute -- a mix of absolute and relative stop points is the kind
+    #: of convention mismatch that produces a vehicle stopping in the middle of
+    #: the intersection and no error anywhere.
+    stop_s: float | None = None
+    #: A **soft** longitudinal bound: the ego must be *able* to stop before this
+    #: arc length, which is a speed ceiling ``v <= sqrt(2 b (s_bound - s))``, not
+    #: an instruction to stop there.  Treating a following distance as a hard
+    #: stop line makes the vehicle brake to rest fifty metres behind a car that
+    #: is still moving at 14 m/s.
+    safety_bound_s: float | None = None
     lead_gap: float | None = None        #: bumper gap to the lead vehicle [m]
     lead_speed: float = 0.0
     lateral_offset: float = 0.0          #: commanded ``e_y`` target [m]
@@ -69,10 +82,30 @@ class BehaviorConfig:
     follow_min_gap: float = 4.0        #: minimum bumper gap [m]
     lane_half_width: float = 1.9       #: lateral window for "on my route" [m]
     conflict_margin: float = 1.2       #: extra clearance in the space-time check [m]
+    #: Deceleration the *leader* is assumed capable of [m/s^2].  The follow
+    #: state converts it into a hard positional bound: if the leader can stop
+    #: within ``v^2 / 2b``, the ego must be able to stop short of that point.
+    #: A speed target alone cannot express this -- a target the planner cannot
+    #: reach within its horizon is silently clamped, and the gap closes anyway.
+    lead_max_decel: float = 6.0
     conflict_horizon: float = 6.0      #: how far ahead conflicts are checked [s]
     stop_offset: float = 2.0           #: stop this far before the line [m]
+    #: Once an overtake is chosen, hold it for at least this long.  A manoeuvre
+    #: re-decided every tick is never executed: the offset target flickers, the
+    #: lattice re-plans from a different homotopy each time, and the vehicle
+    #: arrives at the obstacle still in its own lane.
+    overtake_hold: float = 4.0
+    #: Consecutive ticks a predicted contact must persist before emergency
+    #: braking.  A single frame of it is usually a perception artefact.
+    emergency_confirm: int = 2
     creep_speed: float = 1.5           #: speed while inching for visibility [m/s]
     comfortable_decel: float = 3.0
+    #: A lead slower than this is an obstacle to go around, not a car to follow.
+    overtake_speed: float = 1.0
+    #: Lateral room needed on one side before an overtake is proposed [m]
+    overtake_room: float = 3.0
+    #: Offset commanded when overtaking [m]
+    overtake_offset: float = 3.5
 
 
 class BehaviorPlanner:
@@ -83,6 +116,16 @@ class BehaviorPlanner:
         self.cfg = config or BehaviorConfig()
         self.dilemma = DilemmaZone(comfortable_decel=self.cfg.comfortable_decel)
         self.state = BehaviorState.CRUISE
+        self._overtake_offset = 0.0
+        self._overtake_until = -np.inf
+        self._emergency_streak = 0
+        self._ego_off, self._ego_r = multi_circle_cover(params.length, params.width, 3)
+
+    def reset(self) -> None:
+        self.state = BehaviorState.CRUISE
+        self._overtake_offset = 0.0
+        self._overtake_until = -np.inf
+        self._emergency_streak = 0
 
     # --- helpers -------------------------------------------------------------
 
@@ -98,8 +141,11 @@ class BehaviorPlanner:
 
     def _lead_vehicle(
         self, route: ReferencePath, s_ego: float, predictions: Sequence[Prediction]
-    ) -> tuple[float, float, Prediction] | None:
-        """Nearest object ahead on the ego's own route: ``(gap, speed, prediction)``."""
+    ) -> tuple[float, float, Prediction, float] | None:
+        """Nearest object ahead on the ego's own route.
+
+        Returns ``(gap, speed, prediction, s_object)``.
+        """
         best = None
         seen: set[int] = set()
         for pred in predictions:
@@ -116,34 +162,47 @@ class BehaviorPlanner:
             speed = float(np.linalg.norm(pred.positions[1] - pred.positions[0]) /
                           max(pred.times[1] - pred.times[0], 1e-6))
             if best is None or gap < best[0]:
-                best = (gap, speed, pred)
+                best = (gap, speed, pred, s_obj)
         return best
 
     def conflict_time(
         self,
-        route: ReferencePath,
-        s_of_t: np.ndarray,
+        ego_path: np.ndarray,
         times: np.ndarray,
         predictions: Sequence[Prediction],
         inflate: float = 1.0,
     ) -> tuple[float | None, Prediction | None, float]:
         """Earliest time the ego's swept disc meets any prediction's.
 
-        ``s_of_t`` is where the ego would be at each time under its nominal
-        speed profile.  Every mode of every prediction is tested; a conflict
-        with a low-probability mode is still a conflict, and the returned
-        probability lets the caller decide how much to weigh it.
+        ``ego_path`` is ``(T, 2)``: where the ego is **planned to be** at each
+        time, not where the centerline is.  The distinction is not cosmetic --
+        during a lane change the two differ by a full lane, and a check that
+        assumes the centerline reports a collision with the very obstacle the
+        manoeuvre is avoiding, then cancels the manoeuvre, then reports it
+        again.  That is the loop that produces behaviour chatter.
+
+        Every mode of every prediction is tested; a conflict with a
+        low-probability mode is still a conflict, and the returned probability
+        lets the caller decide how much to weigh it.
         """
-        ego_r = 0.5 * float(np.hypot(self.p.length, self.p.width)) + self.cfg.conflict_margin
+        margin = self.cfg.conflict_margin
+        heads = _path_headings(ego_path)
         for i, t in enumerate(times):
             if t > self.cfg.conflict_horizon:
                 break
-            ego_p = route.position(float(s_of_t[i]))
+            ego_pts = circle_centres(ego_path[i][0], ego_path[i][1], heads[i], self._ego_off)
             for pred in predictions:
-                obj_p = pred.position_at(float(t))
-                r = ego_r + float(np.interp(t, pred.times, pred.radius(inflate)))
-                if float(np.linalg.norm(ego_p - obj_p)) < r:
-                    return float(t), pred, pred.probability
+                obj_off, obj_r = multi_circle_cover(pred.length, pred.width, 3)
+                obj_c = pred.position_at(float(t))
+                obj_h = float(np.interp(t, pred.times, np.unwrap(pred.headings)))
+                sig_lon, sig_lat = pred.ellipse_axes(inflate)
+                a = self._ego_r + obj_r + margin + float(np.interp(t, pred.times, sig_lon))
+                b = self._ego_r + obj_r + margin + float(np.interp(t, pred.times, sig_lat))
+                obj_pts = circle_centres(obj_c[0], obj_c[1], obj_h, obj_off)
+                for ep in ego_pts:
+                    for op in obj_pts:
+                        if ellipse_clearance(ep - op, obj_h, a, b) < 0.0:
+                            return float(t), pred, pred.probability
         return None, None, 0.0
 
     # --- main entry point ----------------------------------------------------
@@ -155,6 +214,7 @@ class BehaviorPlanner:
         v_ego: float,
         times: np.ndarray,
         s_of_t: np.ndarray,
+        ego_path: np.ndarray,
         predictions: Sequence[Prediction],
         speed_limit: float,
         stop_line_s: float | None = None,
@@ -163,17 +223,23 @@ class BehaviorPlanner:
         t_now: float = 0.0,
         box_length: float = 22.0,
         crossing_conflict: bool = False,
+        corridor: tuple[float, float] = (-1.75, 1.75),
+        e_y_ego: float = 0.0,
     ) -> BehaviorDecision:
         cfg = self.cfg
 
         # --- 1. emergency ----------------------------------------------------
-        t_conf, pred, prob = self.conflict_time(route, s_of_t, times, predictions)
+        t_conf, pred, prob = self.conflict_time(ego_path, times, predictions)
         if t_conf is not None and t_conf < cfg.t_emergency:
+            self._emergency_streak += 1
+        else:
+            self._emergency_streak = 0
+        if self._emergency_streak >= cfg.emergency_confirm:
             self.state = BehaviorState.EMERGENCY_STOP
             return BehaviorDecision(
                 state=self.state,
                 target_speed=0.0,
-                stop_s=s_ego + max(stopping_distance(v_ego, self.p.actuator.a_min), 0.5),
+                stop_s=s_ego + max(stopping_distance(v_ego, self.p.actuator.a_min), 0.5),  # absolute
                 reason=f"predicted contact in {t_conf:.2f} s with track {pred.track_id if pred else '?'}",
                 detail={"t_conflict": t_conf, "mode": pred.mode if pred else None},
             )
@@ -184,7 +250,7 @@ class BehaviorPlanner:
             if dist > -1.0:  # not yet committed past the line
                 colour = lights.state(signal_group, t_now)
                 decision = self._signal_decision(
-                    colour, dist, v_ego, lights, signal_group, t_now, box_length
+                    colour, dist, v_ego, lights, signal_group, t_now, box_length, stop_line_s
                 )
                 if decision is not None:
                     self.state = decision.state
@@ -204,29 +270,81 @@ class BehaviorPlanner:
                 detail={"t_conflict": t_conf, "mode": pred.mode if pred else None, "p": prob},
             )
 
-        # --- 4. car following -------------------------------------------------
+        # --- 4. an overtake already in progress stays in progress -------------
+        if t_now < self._overtake_until:
+            self.state = BehaviorState.OVERTAKE
+            return BehaviorDecision(
+                state=self.state,
+                target_speed=min(speed_limit, max(v_ego, 4.0)),
+                lateral_offset=self._overtake_offset,
+                reason="completing the overtake",
+                detail={"until": self._overtake_until},
+            )
+
+        # --- 5. car following -------------------------------------------------
         lead = self._lead_vehicle(route, s_ego, predictions)
         if lead is not None:
-            gap, lead_v, lead_pred = lead
+            gap, lead_v, lead_pred, s_lead = lead
+
+            # A stationary obstacle is not a car to follow.  Following it means
+            # arriving at it slowly and then discovering there is nowhere to go;
+            # the decision to go around has to be made while there is still
+            # room to make it, so it is made here rather than left to the
+            # lattice's cost to discover.
+            if lead_v < cfg.overtake_speed and gap < 6.0 * max(v_ego, 1.0):
+                room_left = corridor[1] - e_y_ego
+                room_right = e_y_ego - corridor[0]
+                if max(room_left, room_right) >= cfg.overtake_room:
+                    side = 1.0 if room_left >= room_right else -1.0
+                    offset = side * min(cfg.overtake_offset, max(room_left, room_right) - 0.4)
+                    self._overtake_offset = float(offset)
+                    self._overtake_until = t_now + cfg.overtake_hold
+                    self.state = BehaviorState.OVERTAKE
+                    return BehaviorDecision(
+                        state=self.state,
+                        target_speed=min(speed_limit, max(v_ego, 4.0)),
+                        lateral_offset=float(offset),
+                        lead_gap=gap,
+                        lead_speed=lead_v,
+                        reason=f"going around a stopped object at {gap:.1f} m",
+                        detail={"room_left": room_left, "room_right": room_right},
+                    )
+
             desired = cfg.follow_min_gap + cfg.follow_time_gap * v_ego
-            if gap < desired * 1.8:
-                # Track the leader's speed, corrected by the gap error.  Not a
-                # full IDM: the MPC does the smoothing, this only sets the
-                # target it converges to.
-                v_target = float(
-                    np.clip(lead_v + 0.6 * (gap - desired), 0.0, speed_limit)
+            if gap < desired * 2.2:
+                # Intelligent Driver Model on the *measured* gap and closing
+                # rate.  A law that reacts only to the gap error is far too
+                # weak when the leader brakes: the gap is still comfortable at
+                # the moment the leader starts, and by the time it is not, the
+                # closing rate is what matters.  The prediction is
+                # constant-velocity and cannot see the braking at all, so this
+                # term is the only thing that does.
+                idm = IDMParams(
+                    v0=speed_limit,
+                    T=cfg.follow_time_gap,
+                    s0=cfg.follow_min_gap,
+                    a_max=min(2.0, self.p.actuator.a_max),
+                    b=cfg.comfortable_decel,
+                    b_emergency=abs(self.p.actuator.a_min),
                 )
+                a_des = idm_acceleration(v_ego, gap, v_ego - lead_v, idm)
+                v_target = float(np.clip(v_ego + a_des * 1.0, 0.0, speed_limit))
+                # Worst case the leader stops as hard as it can; the ego must be
+                # able to stop short of where that leaves it.
+                buffer = cfg.follow_min_gap + 0.5 * (self.p.length + lead_pred.length)
+                stop_bound = s_lead + lead_v**2 / (2.0 * cfg.lead_max_decel) - buffer
                 self.state = BehaviorState.FOLLOW
                 return BehaviorDecision(
                     state=self.state,
                     target_speed=v_target,
+                    safety_bound_s=float(max(stop_bound, s_ego)),
                     lead_gap=gap,
                     lead_speed=lead_v,
                     reason=f"following track {lead_pred.track_id} at {gap:.1f} m",
-                    detail={"desired_gap": desired},
+                    detail={"desired_gap": desired, "stop_bound": stop_bound},
                 )
 
-        # --- 5. cruise --------------------------------------------------------
+        # --- 6. cruise --------------------------------------------------------
         self.state = BehaviorState.CRUISE
         return BehaviorDecision(state=self.state, target_speed=speed_limit, reason="clear")
 
@@ -241,15 +359,16 @@ class BehaviorPlanner:
         group: str,
         t_now: float,
         box_length: float,
+        stop_line_s: float,
     ) -> BehaviorDecision | None:
         cfg = self.cfg
-        stop_s_rel = dist - cfg.stop_offset
+        stop_target = stop_line_s - cfg.stop_offset
 
         if colour is SignalState.RED:
             return BehaviorDecision(
                 state=BehaviorState.STOP_FOR_SIGNAL,
                 target_speed=0.0,
-                stop_s=stop_s_rel,
+                stop_s=stop_target,
                 reason="red light",
                 detail={"distance": dist, "until_green": lights.time_until_green(group, t_now)},
             )
@@ -261,7 +380,7 @@ class BehaviorPlanner:
                 return BehaviorDecision(
                     state=BehaviorState.STOP_FOR_SIGNAL,
                     target_speed=0.0,
-                    stop_s=stop_s_rel,
+                    stop_s=stop_target,
                     reason=f"yellow, dilemma verdict '{verdict}'",
                     detail={"distance": dist, "yellow_left": yellow_left},
                 )
@@ -280,9 +399,19 @@ class BehaviorPlanner:
                     return BehaviorDecision(
                         state=BehaviorState.STOP_FOR_SIGNAL,
                         target_speed=0.0,
-                        stop_s=stop_s_rel,
+                        stop_s=stop_target,
                         reason="green will end before the box is cleared",
                         detail={"time_to_clear": time_to_clear,
                                 "green_left": lights.time_to_change(group, t_now)},
                     )
         return None
+
+
+def _path_headings(path: np.ndarray) -> np.ndarray:
+    """Headings along a sampled path, by forward difference with a held last value."""
+    path = np.asarray(path, dtype=float)
+    if len(path) < 2:
+        return np.zeros(len(path))
+    d = np.diff(path, axis=0)
+    th = np.arctan2(d[:, 1], d[:, 0])
+    return np.concatenate([th, th[-1:]])

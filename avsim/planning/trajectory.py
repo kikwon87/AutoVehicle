@@ -94,15 +94,30 @@ class Trajectory:
         return np.column_stack([self.x, self.y, self.psi, self.v])
 
     def as_reference(self, times: np.ndarray) -> np.ndarray:
-        """Resample onto another time grid, unwrapping the heading first."""
-        return np.column_stack(
-            [
-                np.interp(times, self.t, self.x),
-                np.interp(times, self.t, self.y),
-                wrap_to_pi(np.interp(times, self.t, np.unwrap(self.psi))),
-                np.interp(times, self.t, self.v),
-            ]
-        )
+        """Resample onto another time grid, extrapolating past the horizon.
+
+        ``np.interp`` clamps beyond the last sample, which would place every
+        reference point past the horizon at the *same* position.  An MPC whose
+        horizon outlasts the trajectory then reads that frozen point as "come
+        to a stop here" and brakes -- a decelerating vehicle with no reason for
+        it anywhere in the logs.  Past the end the reference therefore
+        continues in a straight line at the final speed and heading.
+        """
+        times = np.asarray(times, dtype=float)
+        psi_un = np.unwrap(self.psi)
+        x = np.interp(times, self.t, self.x)
+        y = np.interp(times, self.t, self.y)
+        psi = np.interp(times, self.t, psi_un)
+        v = np.interp(times, self.t, self.v)
+
+        over = times > self.t[-1]
+        if over.any():
+            dt = times[over] - self.t[-1]
+            x[over] = self.x[-1] + self.v[-1] * np.cos(psi_un[-1]) * dt
+            y[over] = self.y[-1] + self.v[-1] * np.sin(psi_un[-1]) * dt
+            psi[over] = psi_un[-1]
+            v[over] = self.v[-1]
+        return np.column_stack([x, y, wrap_to_pi(psi), v])
 
 
 @dataclass
@@ -152,25 +167,22 @@ class FrenetLatticePlanner:
     # --- generation ----------------------------------------------------------
 
     def _to_cartesian(self, path: ReferencePath, s: np.ndarray, e_y: np.ndarray, de_y: np.ndarray, ds: np.ndarray):
-        n = len(s)
-        x = np.empty(n)
-        y = np.empty(n)
-        psi = np.empty(n)
-        v = np.empty(n)
-        for i in range(n):
-            si = float(np.clip(s[i], 0.0, path.length))
-            p = path.position(si)
-            th = path.heading(si)
-            kap = path.curvature(si)
-            x[i] = p[0] - e_y[i] * np.sin(th)
-            y[i] = p[1] + e_y[i] * np.cos(th)
-            # Frenet inverse: the heading offset comes from de_y/ds, and the
-            # speed from both components of the Frenet velocity.
-            den = 1.0 - kap * e_y[i]
-            de_ds = de_y[i] / max(ds[i], 1e-3)
-            dpsi = np.arctan2(de_ds, max(den, 1e-3))
-            psi[i] = wrap_to_pi(th + dpsi)
-            v[i] = float(np.hypot(ds[i] * den, de_y[i]))
+        """Frenet to world, vectorized over the whole candidate.
+
+        The heading offset comes from ``de_y/ds`` and the speed from both
+        components of the Frenet velocity, with the denominator
+        ``1 - kappa e_y`` floored -- the Frenet map is singular where it
+        vanishes, and a candidate that reaches there is not merely inaccurate,
+        it is meaningless.
+        """
+        px, py, th, kap = path.frames(s)
+        sin_th, cos_th = np.sin(th), np.cos(th)
+        x = px - e_y * sin_th
+        y = py + e_y * cos_th
+        den = np.maximum(1.0 - kap * e_y, 1e-3)
+        de_ds = de_y / np.maximum(ds, 1e-3)
+        psi = wrap_to_pi(th + np.arctan2(de_ds, den))
+        v = np.hypot(ds * den, de_y)
         return x, y, psi, v
 
     def generate(
@@ -185,12 +197,20 @@ class FrenetLatticePlanner:
         target_offset: float = 0.0,
         stop_s: float | None = None,
         corridor: tuple[float, float] | None = None,
+        a0: float = 0.0,
     ) -> list[Trajectory]:
         """Build the candidate set for the current situation.
 
         ``corridor`` is the ``(e_y_min, e_y_max)`` box the trajectory must stay
         inside -- the road boundary expressed in Frenet coordinates, which is
         the whole reason the Frenet frame was adopted.
+
+        ``a0`` is the longitudinal acceleration the plan starts from.  Leaving
+        it at zero -- as a naive minimum-jerk formulation does -- means every
+        replan begins with no deceleration, and since only the first step of
+        each plan is ever executed, the vehicle can never brake harder than the
+        first derivative of a curve that starts flat.  Against a leader braking
+        at 4 m/s^2 that is the difference between stopping and not.
         """
         cfg = self.cfg
         out: list[Trajectory] = []
@@ -206,10 +226,26 @@ class FrenetLatticePlanner:
                 lon_specs = []
                 if stop_s is not None:
                     s_end = max(stop_s, s0)
-                    lon_specs.append(("stop", quintic(s0, v0, 0.0, s_end, 0.0, 0.0, T)))
+                    lon_specs.append(("stop", quintic(s0, v0, a0, s_end, 0.0, 0.0, T)))
+                # Clamp each sampled target speed to what is reachable in T at
+                # the acceleration limits.  Without this, a vehicle pulling away
+                # from a stop samples only targets it cannot reach, every
+                # candidate is rejected as over-accelerating, and the planner
+                # reports "no plan" on an empty road.
+                # A minimum-jerk speed change peaks at 1.5x its average:
+                # v(tau) = v0 + dv (3 tau^2 - 2 tau^3) has |v'|_max = 1.5 dv / T.
+                # Clamping to the average alone still samples targets whose peak
+                # acceleration violates the limit, so every candidate is
+                # rejected -- which is what makes a stopped vehicle unable to
+                # find any plan and never pull away.
+                peak = 1.5
+                v_hi = v0 + cfg.a_lon_max * T / peak
+                v_lo = max(v0 + cfg.a_lon_min * T / peak, 0.0)
+                if a0 < 0.0:  # already braking: that speed is reachable too
+                    v_lo = max(v0 + (cfg.a_lon_min + a0) * T / (2 * peak), 0.0)
                 for dv in cfg.speed_samples:
-                    v_t = max(target_speed + dv, 0.0)
-                    lon_specs.append(("keep", quartic(s0, v0, 0.0, v_t, 0.0, T)))
+                    v_t = float(np.clip(target_speed + dv, v_lo, v_hi))
+                    lon_specs.append(("keep", quartic(s0, v0, a0, max(v_t, 0.0), 0.0, T)))
 
                 for kind, cs in lon_specs:
                     s = _poly(cs, t)
@@ -246,6 +282,13 @@ class FrenetLatticePlanner:
         dpsi = np.gradient(np.unwrap(psi), t)
         return dpsi / np.maximum(v, 0.3)
 
+    #: Below this speed the path-curvature of a trajectory is not a meaningful
+    #: quantity -- ``kappa = dpsi/ds`` divides by a vanishing ``ds`` -- so the
+    #: geometric checks are skipped.  A stopped vehicle has no curvature, and
+    #: rejecting a stop because its numerical curvature is large is a bug, not
+    #: a safety feature.
+    CURVATURE_SPEED_FLOOR = 0.8
+
     def _feasibility(self, traj: Trajectory, corridor: tuple[float, float] | None = None) -> str:
         cfg = self.cfg
         if corridor is not None:
@@ -255,11 +298,14 @@ class FrenetLatticePlanner:
                     f"leaves the corridor: e_y in [{traj.e_y.min():.2f}, "
                     f"{traj.e_y.max():.2f}] vs [{lo:.2f}, {hi:.2f}]"
                 )
-        if np.max(np.abs(traj.kappa)) > cfg.kappa_max:
-            return f"curvature {np.max(np.abs(traj.kappa)):.3f} > {cfg.kappa_max:.3f}"
-        a_lat = traj.v**2 * np.abs(traj.kappa)
-        if np.max(a_lat) > cfg.a_lat_limit:
-            return f"a_y {np.max(a_lat):.2f} > {cfg.a_lat_limit:.2f}"
+        moving = traj.v > self.CURVATURE_SPEED_FLOOR
+        if moving.any():
+            kap = np.abs(traj.kappa[moving])
+            if kap.max() > cfg.kappa_max:
+                return f"curvature {kap.max():.3f} > {cfg.kappa_max:.3f}"
+            a_lat = traj.v[moving] ** 2 * kap
+            if a_lat.max() > cfg.a_lat_limit:
+                return f"a_y {a_lat.max():.2f} > {cfg.a_lat_limit:.2f}"
         if np.max(traj.a) > cfg.a_lon_max + 1e-6 or np.min(traj.a) < cfg.a_lon_min - 1e-6:
             return f"a_x range [{np.min(traj.a):.2f}, {np.max(traj.a):.2f}] outside limits"
         return ""
@@ -326,6 +372,7 @@ class FrenetLatticePlanner:
         target_offset: float = 0.0,
         stop_s: float | None = None,
         corridor: tuple[float, float] | None = None,
+        a0: float = 0.0,
     ) -> Trajectory | None:
         """Return the lowest-cost feasible, unblocked candidate, or ``None``.
 
@@ -335,7 +382,7 @@ class FrenetLatticePlanner:
         trajectory that quietly violates something.
         """
         cands = self.generate(
-            path, s0, e_y0, de_y0, dde_y0, v0, target_speed, target_offset, stop_s, corridor
+            path, s0, e_y0, de_y0, dde_y0, v0, target_speed, target_offset, stop_s, corridor, a0
         )
         best, best_cost = None, np.inf
         for c in cands:

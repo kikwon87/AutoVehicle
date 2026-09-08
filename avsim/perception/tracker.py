@@ -85,9 +85,15 @@ class MultiObjectTracker:
     def __init__(
         self,
         dt: float,
-        process_accel_std: float = 1.0,
-        gate_chi2: float = 9.21,   #: 99% for 2 dof
-        n_confirm: int = 3,
+        #: Process noise as an acceleration standard deviation.  It must cover
+        #: the *manoeuvres* the tracked objects actually perform: a leader
+        #: braking at 4 m/s^2 violates a constant-velocity model badly enough
+        #: that a tight gate rejects its own detections, deletes the track and
+        #: re-spawns it with zero velocity -- precisely when the follow
+        #: controller needs the velocity most.
+        process_accel_std: float = 3.0,
+        gate_chi2: float = 13.8,   #: 99.9% for 2 dof
+        n_confirm: int = 2,
         n_miss: int = 5,
         max_tracks: int = 64,
     ):
